@@ -71,6 +71,21 @@ import * as util from 'lo-event/util';
 | `lo-event/util` | Utility functions |
 | `lo-event/null` | Null logger (no-op) |
 
+## Examples
+
+The `examples/` directory has interactive browser demos:
+
+- **Browser Events** (`browser_events.html`) — Captures keystrokes, mouse, clipboard, and other DOM events using `subscribeToEvents`. Shows how metadata collectors work.
+- **Redux Loop** (`redux_loop.html`) — Demonstrates the Redux logger, where events flow through a Redux store so application state and event logging share one data flow.
+
+To run them:
+
+```bash
+npm run browser
+```
+
+This starts a Parcel dev server and opens the example index page.
+
 ## Testing
 
 ```bash

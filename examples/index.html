@@ -2,13 +2,36 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Examples</title>
+    <title>lo-event Examples</title>
   </head>
   <body>
-    <h1> Examples </h1>
+    <h1>lo-event Examples</h1>
+
+    <p>
+      These demos show how to use lo-event in a browser. Run them with:
+    </p>
+    <pre>npm run browser</pre>
+    <p>
+      This starts a <a href="https://parceljs.org/">Parcel</a> dev server
+      that bundles the TypeScript sources on the fly.
+    </p>
+
     <ul>
-      <li> <a href="browser_events.html"> Demo of capturing keystroke, cut, copy, etc. events </a> </li>
-      <li> <a href="redux_loop.html"> Demo of redux, with actions! </a> </li>
+      <li>
+        <a href="browser_events.html">Browser Events</a> &mdash;
+        Captures keystroke, mouse, clipboard, and other DOM events using
+        <code>subscribeToEvents</code>. Events are displayed on-page and
+        logged to the browser console via <code>consoleLogger</code>.
+        Also demonstrates metadata collection (browser info, Chrome
+        identity, local/session storage).
+      </li>
+      <li>
+        <a href="redux_loop.html">Redux Loop</a> &mdash;
+        Demonstrates the Redux logger integration. Events dispatched
+        via <code>lo_event.logEvent</code> flow through Redux, so
+        application state and event history live in a single store.
+        Includes a button that emits a click event.
+      </li>
     </ul>
   </body>
 </html>
