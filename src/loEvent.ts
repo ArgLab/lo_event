@@ -8,6 +8,8 @@ import * as Queue from './queue.js';
 import * as disabler from './disabler.js';
 import * as debug from './debugLog.js';
 import * as util from './util.js';
+import type { Logger, MetadataTask } from './types.js';
+import type { LogDestination } from './debugLog.js';
 
 export const QueueType = Queue.QueueType;
 
@@ -18,17 +20,17 @@ const INIT_STATES = {
   LOGGERS_READY: 'LOGGERS_READY', // loggers initialized, but queuing initial events / auth
   READY: 'READY', // Events streaming to loggers (which might have their own queues)
   ERROR: 'ERROR' // Something went very, very wrong
-};
+} as const;
 
-let initialized = INIT_STATES.NOT_STARTED; // Current FSM state
-let currentState = new Promise((resolve, reject) => { resolve(); }); // promise pipeline to ensure we handle all initialization
+let initialized: string = INIT_STATES.NOT_STARTED; // Current FSM state
+let currentState: Promise<unknown> = Promise.resolve(); // promise pipeline to ensure we handle all initialization
 
 
-let loggersEnabled = []; // A list of all loggers which should receive events.
-let queue;
-let pendingSource;
-let pendingVersion;
-let pendingMetadata = [];
+let loggersEnabled: Logger[] = []; // A list of all loggers which should receive events.
+let queue: Queue.Queue;
+let pendingSource: string;
+let pendingVersion: string;
+let pendingMetadata: MetadataTask[] = [];
 
 function isInitialized () {
   return initialized === INIT_STATES.READY;
@@ -44,7 +46,7 @@ async function initializeLoggers () {
   debug.info('initializing loggers');
   const initializedLoggers = loggersEnabled
     .filter(logger => typeof logger.init === 'function') // Filter out loggers without .init property
-    .map(logger => logger.init()); // Call .init() on each logger, which may return a promise
+    .map(logger => logger.init!()); // Call .init() on each logger, which may return a promise
 
   try {
     await Promise.all(initializedLoggers);
@@ -62,7 +64,7 @@ async function initializeLoggers () {
  * When initializing `lo_event`, clients can set which metadata items
  * they wish to include.
  */
-export async function compileMetadata(metadataTasks) {
+export async function compileMetadata(metadataTasks: MetadataTask[]) {
   const taskPromises = metadataTasks.map(async task => {
     try {
       const result = await Promise.resolve(task.func());
@@ -74,8 +76,7 @@ export async function compileMetadata(metadataTasks) {
   });
 
   const results = await Promise.all(taskPromises);
-  setFieldSet(results);
-  return results.filter(Boolean);
+  return results.filter((r): r is Record<string, unknown> => r !== null);
 }
 
 
@@ -94,21 +95,21 @@ export async function compileMetadata(metadataTasks) {
  * Each individual logger should keep track of state and
  * handle their respecitive reconnects properly.
  */
-export function setFieldSet (data) {
+export function lockFields (data: Record<string, unknown>[]) {
   currentState = currentState.then(
-    () => setFieldSetAsync(data)
+    () => lockFieldsAsync(data)
   );
 }
 
 /**
  * Runs and awaits for all loggers to run their `setField` command
  */
-async function setFieldSetAsync (data) {
+async function lockFieldsAsync (data: Record<string, unknown>[]) {
   const payload = { fields: await mergeMetadata(data), event: 'lock_fields' };
   timestampEvent(payload);
   const authpromises = loggersEnabled
     .filter(logger => typeof logger.setField === 'function')
-    .map(logger => logger.setField(JSON.stringify(payload)));
+    .map(logger => logger.setField!(JSON.stringify(payload)));
 
   await Promise.all(authpromises);
 }
@@ -117,17 +118,17 @@ async function setFieldSetAsync (data) {
 // might use, and outlining what can be expected in the protocol
 // TODO: We should consider structing / destructing here
 export function init (
-  source,
-  version,
-  loggers, // e.g. [console_logger(), websocket_logger("/foo/bar")]
+  source: string,
+  version: string,
+  loggers: Logger[],
   {
     debugLevel = debug.LEVEL.NONE,
-    debugDest = [debug.LOG_OUTPUT.CONSOLE],
+    debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
-    queueType = Queue.QueueType.AUTODETECT,
+    queueType = Queue.QueueType.AUTODETECT as string,
     sendBrowserInfo = false,
     verboseEvents = false,
-    metadata = [],
+    metadata = [] as MetadataTask[],
   } = {}
 ) {
   if (!source || typeof source !== 'string') throw new Error('source must be a non-null string');
@@ -158,20 +159,27 @@ export function init (
 /**
  * Begin dequeuing and streaming events.
  *
- * This should be called after init() and any preauth setFieldSet()
+ * This should be called after init() and any preauth lockFields()
  * calls. Source/version and metadata are sent here so that preauth
  * fields (set between init() and go()) are transmitted first.
  *
  * Typical usage:
  *   lo_event.init(source, version, loggers, options);
- *   lo_event.setFieldSet([{ preauth_type: 'test' }]);   // sent first
- *   lo_event.setFieldSet([{ postauth: 'data' }]);       // sent second
+ *   lo_event.lockFields([{ preauth_type: 'test' }]);   // sent first
+ *   lo_event.lockFields([{ postauth: 'data' }]);       // sent second
  *   lo_event.go();  // source/version sent here, then streaming begins
  */
 export function go () {
-  setFieldSet([{ source: pendingSource, version: pendingVersion }]);
-  compileMetadata(pendingMetadata);
-  currentState.then(() => {
+  lockFields([{ source: pendingSource, version: pendingVersion }]);
+  currentState = currentState.then(async () => {
+    const results = await compileMetadata(pendingMetadata);
+    await lockFieldsAsync(results);
+  });
+  currentState = currentState.then(() => {
+    if (initialized === INIT_STATES.ERROR) {
+      debug.error('Cannot start dequeue loop: logger initialization failed');
+      return;
+    }
     initialized = INIT_STATES.READY;
     queue.startDequeueLoop({
       initialize: isInitialized,
@@ -181,7 +189,7 @@ export function go () {
   });
 }
 
-function sendEvent (event) {
+function sendEvent (event: unknown) {
   const jsonEncodedEvent = JSON.stringify(event);
   for (const logger of loggersEnabled) {
     try {
@@ -198,7 +206,7 @@ function sendEvent (event) {
   }
 }
 
-export function logEvent (eventType, event) {
+export function logEvent (eventType: string, event: Record<string, unknown>) {
   // opt out / dead
   if (!disabler.storeEvents()) {
     return;
@@ -226,7 +234,7 @@ export function logXAPILite (
     result,
     context,
     attachments
-  }
+  }: { verb: string; object?: unknown; result?: unknown; context?: unknown; attachments?: unknown }
 ) {
   logEvent(verb,
     { object, result, context, attachments }

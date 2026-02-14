@@ -21,8 +21,8 @@ loEvent.init(
     debugDest: [debug.LOG_OUTPUT.LOGGER(loEvent.logEvent)]
   }
 );
-loEvent.setFieldSet([{ preauth_type: 'test' }]);
-loEvent.setFieldSet([{ postauth_type: 'test' }, getBrowserInfo()]);
+loEvent.lockFields([{ preauth_type: 'test' }]);
+loEvent.lockFields([{ postauth_type: 'test' }, getBrowserInfo()]);
 loEvent.go();
 
 console.log('lo_event test: Initialized');

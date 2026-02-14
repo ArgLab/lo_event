@@ -3,14 +3,17 @@ import * as disabler from './disabler.js';
 import * as util from './util.js';
 import * as debug from './debugLog.js';
 import { storage } from './browserStorage.js';
+import type { Logger } from './types.js';
 
-function wsHost(overrides = {}, loc=window.location) {
+interface WsHostOverrides {
+  hostname?: string;
+  port?: string | number;
+  path?: string;
+  url?: string;
+}
+
+function wsHost(overrides: WsHostOverrides = {}, loc = window.location) {
   const { hostname, port, path, url } = overrides;
-  const loServer = storage.get('lo_server');
-  if (loServer) {
-    console.log("Overriding server from storage");
-    return loServer;
-  }
   const protocol = loc.protocol === 'https:' ? 'wss://' : 'ws://';
   const host = hostname || loc.hostname;
   const portNumber = port || loc.port || (loc.protocol === 'https:' ? 443 : 80);
@@ -21,7 +24,7 @@ function wsHost(overrides = {}, loc=window.location) {
 }
 
 
-export function websocketLogger (server = {}) {
+export function websocketLogger (server: string | WsHostOverrides = {}): Logger {
   /*
     This is a pretty complex logger, which sends events over a web
     socket.
@@ -37,35 +40,37 @@ export function websocketLogger (server = {}) {
     robust about queuing events before we have a socket open or during
     a network failure.
   */
-  let socket; // Our actual socket used to send and receive data.
-  let WSLibrary; // For compatibility between node and browser, this either points to the browser WebSocket or to a compatibility library.
+  let socket: WebSocket | null = null;
+  // Minimal WebSocket constructor — works with both browser WebSocket and the `ws` package
+  let WSLibrary: new (url: string) => WebSocket;
   const queue = new Queue('websocketLogger');
   // This holds an exception, if we're blacklisted, between the web
   // socket and the API. We generate this when we receive a message,
   // which is not a helpful place to raise the exception from, so we
   // keep this around until we're called from the client, and then we
   // raise it there.
-  let blockerror;
-  let metadata = {};
+  let blockerror: disabler.BlockError | null = null;
+  let metadata: Record<string, unknown> = {};
 
-  // This logic might be moved into wsHost, so it's a little bit more
-  // consistent.
+  // Resolve server to a URL string
+  let serverUrl: string;
   if(!server) {
-    server = wsHost();
+    serverUrl = wsHost();
   } else if(typeof server === 'object') {
-    server = wsHost(server);
+    serverUrl = wsHost(server);
+  } else {
+    serverUrl = server;
   }
-  // else the server is likely already a url string
 
-  function calculateExponentialBackoff (n) {
+  function calculateExponentialBackoff (n: number) {
     return Math.min(1000 * Math.pow(2, n), 1000 * 60 * 15);
   }
 
   let failures = 0;
   let READY = false;
-  let wsFailureResolve = null;
-  let wsFailurePromise = null;
-  let wsConnectedResolve = null;
+  let wsFailureResolve: (() => void) | null = null;
+  let wsFailurePromise: Promise<void> | null = null;
+  let wsConnectedResolve: ((value: boolean) => void) | null = null;
 
   async function startWebsocketConnectionLoop () {
     while (true) {
@@ -85,20 +90,20 @@ export function websocketLogger (server = {}) {
   function socketClosed () { return wsFailurePromise; }
 
   function newWebsocket () {
-    socket = new WSLibrary(server);
-    wsFailurePromise = new Promise((resolve, reject) => {
+    socket = new WSLibrary(serverUrl);
+    wsFailurePromise = new Promise<void>((resolve) => {
       wsFailureResolve = resolve;
     });
-    const wsConnectedPromise = new Promise((resolve, reject) => {
+    const wsConnectedPromise = new Promise<boolean>((resolve) => {
       wsConnectedResolve = resolve;
     });
-    socket.onopen = () => { prepareSocket(); wsConnectedResolve(true); };
+    socket.onopen = () => { prepareSocket(); wsConnectedResolve!(true); };
     socket.onerror = function (e) {
       debug.error('Could not connect to websocket', e);
-      wsConnectedResolve(false);
-      wsFailureResolve();
+      wsConnectedResolve!(false);
+      wsFailureResolve!();
     };
-    socket.onclose = () => { wsConnectedResolve(false); wsFailureResolve(); };
+    socket.onclose = () => { wsConnectedResolve!(false); wsFailureResolve!(); };
     socket.onmessage = receiveMessage;
     return wsConnectedPromise;
   }
@@ -109,8 +114,8 @@ export function websocketLogger (server = {}) {
     }
   }
 
-  async function socketSend (item) {
-    socket.send(item);
+  async function socketSend (item: unknown) {
+    socket!.send(item as string);
   }
 
   async function waitForWSReady () {
@@ -122,7 +127,7 @@ export function websocketLogger (server = {}) {
     );
   }
 
-  function receiveMessage (event) {
+  function receiveMessage (event: MessageEvent) {
     const response = JSON.parse(event.data);
     switch (response.status) {
       case 'blocklist':
@@ -159,20 +164,32 @@ export function websocketLogger (server = {}) {
       console.log('Throwing block error');
       const b = blockerror;
       blockerror = null;
-      socket.close();
+      socket!.close();
       throw b;
     }
   }
 
-  function wsLogData (data) {
+  function wsLogData (data: string) {
     checkForBlockError();
     queue.enqueue(data);
   }
 
   wsLogData.init = async function () {
+    // Check storage for server override (the storage API is callback-based,
+    // so this must happen in async context, not at construction time)
+    try {
+      const stored = await new Promise(resolve => storage.get('lo_server', resolve));
+      if (stored && (stored as Record<string, unknown>).lo_server) {
+        debug.info('Overriding server from storage');
+        serverUrl = (stored as Record<string, unknown>).lo_server as string;
+      }
+    } catch (e) {
+      debug.info('Could not check storage for server override');
+    }
+
     if (typeof WebSocket === 'undefined') {
       debug.info('Importing ws');
-      WSLibrary = (await import('ws')).WebSocket;
+      WSLibrary = (await import('ws')).WebSocket as unknown as new (url: string) => WebSocket;
     } else {
       debug.info('Using built-in websocket');
       WSLibrary = WebSocket;
@@ -185,16 +202,16 @@ export function websocketLogger (server = {}) {
     });
   };
 
-  wsLogData.setField = function (data) {
+  wsLogData.setField = function (data: string) {
     util.mergeDictionary(metadata, JSON.parse(data));
     queue.enqueue(data);
   };
 
-  function handleSaveBlob (blob) {
+  function handleSaveBlob (blob: unknown) {
     queue.enqueue(JSON.stringify({ event: 'save_blob', blob }));
   }
 
-  util.consumeCustomEvent('save_blob', handleSaveBlob)
+  util.consumeCustomEvent('save_blob', handleSaveBlob);
 
-  return wsLogData;
+  return wsLogData as Logger;
 }

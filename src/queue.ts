@@ -2,14 +2,15 @@ import * as indexeddbQueue from './indexeddbQueue.js';
 import * as memoryQueue from './memoryQueue.js';
 import * as debug from './debugLog.js';
 import * as util from './util.js';
+import type { QueueBackend, DequeueLoopConfig } from './types.js';
 
 export const QueueType = {
   AUTODETECT: 'AUTODETECT', // Persistent if available, otherwise in-memory
   IN_MEMORY: 'IN_MEMORY', // memoryQueue
   PERSISTENT: 'PERSISTENT' // SQLite or IndexedDB. Raise an exception if not available.
-};
+} as const;
 
-const queueClasses = {
+const queueClasses: Record<string, new (name: string) => QueueBackend> = {
   [QueueType.IN_MEMORY]: memoryQueue.Queue,
   [QueueType.PERSISTENT]: indexeddbQueue.Queue
 };
@@ -20,12 +21,13 @@ function autodetect () {
   } else {
     return QueueType.PERSISTENT;
   }
-};
+}
 
 export class Queue {
-  constructor (queueName, { queueType = QueueType.AUTODETECT } = {}) {
-    this.queue = null;
+  private queue: QueueBackend;
+  startDequeueLoop: (config: DequeueLoopConfig) => Promise<void>;
 
+  constructor (queueName: string, { queueType = QueueType.AUTODETECT as string } = {}) {
     if (queueType === QueueType.AUTODETECT) {
       queueType = autodetect();
     }
@@ -39,10 +41,10 @@ export class Queue {
     }
 
     this.enqueue = this.enqueue.bind(this);
-    this.startDequeueLoop = util.once(this.startDequeueLoop.bind(this));
+    this.startDequeueLoop = util.once(this._startDequeueLoop.bind(this));
   }
 
-  enqueue (item) {
+  enqueue (item: unknown) {
     this.queue.enqueue(item);
   }
 
@@ -51,12 +53,12 @@ export class Queue {
    * dequeue items and process them appropriately
    * based on provided functions.
    */
-  async startDequeueLoop ({
+  private async _startDequeueLoop ({
     initialize = async () => true,
     shouldDequeue = async () => true,
-    onDequeue = async (item) => {},
-    onError = (message, error) => debug.error(message, error)
-  }) {
+    onDequeue = async (_item: unknown) => {},
+    onError = (message: string, error: unknown) => debug.error(message, error)
+  }: DequeueLoopConfig = {}) {
     try {
       if (!await initialize()) {
         throw new Error('QUEUE ERROR: Initialization function returned false.');

@@ -1,27 +1,35 @@
 {
   "name": "lo-event",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Event logging library for the Learning Observer",
-  "main": "src/loEvent.js",
-  "files": ["src/", "README.md", "LICENSE.TXT"],
+  "main": "dist/loEvent.js",
+  "types": "dist/loEvent.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE.TXT"
+  ],
   "exports": {
-    ".": "./src/loEvent.js",
-    "./redux": "./src/reduxLogger.js",
-    "./debug": "./src/debugLog.js",
-    "./console": "./src/consoleLogger.js",
-    "./websocket": "./src/websocketLogger.js",
-    "./browser-events": "./src/browserEvents.js",
-    "./queue": "./src/queue.js",
-    "./storage": "./src/browserStorage.js",
-    "./disabler": "./src/disabler.js",
-    "./util": "./src/util.js",
-    "./null": "./src/nullLogger.js"
+    ".": { "types": "./dist/loEvent.d.ts", "import": "./dist/loEvent.js" },
+    "./redux": { "types": "./dist/reduxLogger.d.ts", "import": "./dist/reduxLogger.js" },
+    "./debug": { "types": "./dist/debugLog.d.ts", "import": "./dist/debugLog.js" },
+    "./console": { "types": "./dist/consoleLogger.d.ts", "import": "./dist/consoleLogger.js" },
+    "./websocket": { "types": "./dist/websocketLogger.d.ts", "import": "./dist/websocketLogger.js" },
+    "./browser-events": { "types": "./dist/browserEvents.d.ts", "import": "./dist/browserEvents.js" },
+    "./queue": { "types": "./dist/queue.d.ts", "import": "./dist/queue.js" },
+    "./storage": { "types": "./dist/browserStorage.d.ts", "import": "./dist/browserStorage.js" },
+    "./disabler": { "types": "./dist/disabler.d.ts", "import": "./dist/disabler.js" },
+    "./util": { "types": "./dist/util.d.ts", "import": "./dist/util.js" },
+    "./null": { "types": "./dist/nullLogger.d.ts", "import": "./dist/nullLogger.js" }
   },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
     "browser": "parcel examples/*.html --open",
-    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo-event-*.tgz"
+    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo-event-*.tgz",
+    "lint": "eslint src/ tests/"
   },
   "repository": {
     "type": "git",
@@ -43,8 +51,16 @@
     "ws": "^8.14.2"
   },
   "devDependencies": {
-    "vitest": "^3.0.0",
-    "parcel": "^2.12.0"
+    "@types/lodash": "^4.17.23",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/parser": "^8.55.0",
+    "eslint": "^9.39.2",
+    "globals": "^17.3.0",
+    "parcel": "^2.12.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.0"
   },
   "browser": {
     "fs": false

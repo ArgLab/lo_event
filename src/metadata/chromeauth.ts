@@ -21,24 +21,23 @@
 */
 function chromeProfileInfoWrapper() {
   if (typeof chrome !== 'undefined' && chrome.identity) {
+    const identity = chrome.identity;
     try {
-      return new Promise((resolve, reject) => {
-        chrome.identity.getProfileUserInfo({ accountStatus: 'ANY' }, function (data) {
+      return new Promise((resolve) => {
+        identity.getProfileUserInfo({ accountStatus: 'ANY' }, function (data) {
           resolve(data);
         });
       });
     } catch (e) {
-      return new Promise((resolve, reject) => {
-        chrome.identity.getProfileUserInfo(function (data) {
+      return new Promise((resolve) => {
+        identity.getProfileUserInfo(function (data) {
           resolve(data);
         });
       });
     }
   }
   // Default to an empty object
-  return new Promise((resolve, reject) => {
-    resolve({});
-  });
+  return Promise.resolve({});
 }
 
 export const chromeAuth = () => ({

@@ -27,8 +27,23 @@ import * as util from './util.js';
 const ENQUEUE = 'enqueue';
 const DEQUEUE = 'dequeue';
 
+interface DBOperation {
+  operation: string;
+  payload?: { payload: unknown };
+  resolve?: (value: unknown) => void;
+  reject?: (reason?: unknown) => void;
+}
+
 export class Queue {
-  constructor (queueName) {
+  private db: IDBDatabase | null;
+  private dbOperationQueue: DBOperation[];
+  private nextDBOperationPromise: ((value: DBOperation) => void) | null;
+  private nextItemPromise: ((value: unknown) => void) | null;
+  private queueName: string;
+  private dbOperationDispatch: Record<string, (op: DBOperation) => Promise<void>>;
+  nextDBOperation: () => AsyncGenerator<DBOperation>;
+
+  constructor (queueName: string) {
     this.db = null;
     this.dbOperationQueue = [];
     this.nextDBOperationPromise = null;
@@ -38,7 +53,7 @@ export class Queue {
     this.initialize = this.initialize.bind(this);
     this.addItemToDB = this.addItemToDB.bind(this);
     this.nextItemFromDB = this.nextItemFromDB.bind(this);
-    this.nextDBOperation = util.once(this.nextDBOperation.bind(this));
+    this.nextDBOperation = util.once(this._nextDBOperation.bind(this));
     this.startProcessing = this.startProcessing.bind(this);
     this.addItemToDBOperationQueue = this.addItemToDBOperationQueue.bind(this);
     this.enqueue = this.enqueue.bind(this);
@@ -79,18 +94,18 @@ export class Queue {
       request = indexedDB.open(this.queueName, 1);
     }
 
-    request.onerror = (event) => {
-      debug.error('QUEUE ERROR: could not open database', event.target.error);
+    request.onerror = () => {
+      debug.error('QUEUE ERROR: could not open database', request.error);
     };
 
-    request.onupgradeneeded = async (event) => {
-      this.db = event.target.result;
+    request.onupgradeneeded = async () => {
+      this.db = request.result;
       const objectStore = this.db.createObjectStore(this.queueName, { keyPath: 'id', autoIncrement: true });
       objectStore.createIndex('id', 'id');
     };
 
-    request.onsuccess = (event) => {
-      this.db = event.target.result;
+    request.onsuccess = () => {
+      this.db = request.result;
       this.startProcessing();
     };
   }
@@ -101,27 +116,28 @@ export class Queue {
    * we resolve the item immediately and don't add it to
    * the indexeddb.
    */
-  async addItemToDB ({ payload }) {
+  async addItemToDB (op: DBOperation) {
+    const payload = op.payload!;
     if (this.nextItemPromise) {
       this.nextItemPromise(payload.payload);
       this.nextItemPromise = null;
       return;
     }
     debug.info(`idbQueue: adding item to database, ${payload}`);
-    const transaction = this.db.transaction([this.queueName], 'readwrite');
+    const transaction = this.db!.transaction([this.queueName], 'readwrite');
     const objectStore = transaction.objectStore(this.queueName);
 
     const request = objectStore.add(payload);
 
-    request.onsuccess = (event) => {
+    request.onsuccess = () => {
       // successful request added
     };
 
-    request.onerror = (event) => {
-      if (event.target.error.name === 'ConstraintError') {
-        debug.error('IDBQUEUE ERROR: Item already exists', event.target.error);
+    request.onerror = () => {
+      if (request.error?.name === 'ConstraintError') {
+        debug.error('IDBQUEUE ERROR: Item already exists', request.error);
       } else {
-        debug.error('IDBQUEUE ERROR: Error adding item to the queue:', event.target.error);
+        debug.error('IDBQUEUE ERROR: Error adding item to the queue:', request.error);
       }
     };
   }
@@ -129,37 +145,38 @@ export class Queue {
   /**
    * Perform transaction to fetch next item in indexeddb
    */
-  async nextItemFromDB ({ resolve, reject }) {
+  async nextItemFromDB (op: DBOperation) {
+    const { resolve, reject } = op;
     debug.info('idbQueue: Fetching next item from database');
-    const transaction = this.db.transaction([this.queueName], 'readwrite');
+    const transaction = this.db!.transaction([this.queueName], 'readwrite');
     const objectStore = transaction.objectStore(this.queueName);
     const request = objectStore.openCursor();
 
-    request.onsuccess = (event) => {
-      const cursor = event.target.result;
+    request.onsuccess = () => {
+      const cursor = request.result;
       if (cursor) {
         const item = cursor.value;
         const deleteRequest = objectStore.delete(cursor.key);
 
         deleteRequest.onsuccess = () => {
-          resolve(item.payload);
+          resolve!(item.payload);
         };
 
-        deleteRequest.onerror = (event) => {
-          debug.error('IDBQUEUE ERROR: Error removing item from the queue:', event.target.error);
-          reject(event.target.error);
+        deleteRequest.onerror = () => {
+          debug.error('IDBQUEUE ERROR: Error removing item from the queue:', deleteRequest.error);
+          reject!(deleteRequest.error);
         };
       } else {
         // No more items in the IndexedDB.
-        resolve(new Promise((resolve) => {
+        resolve!(new Promise((resolve) => {
           this.nextItemPromise = resolve;
         }));
       }
     };
 
-    request.onerror = (event) => {
-      debug.error('IDBQUEUE ERROR: Error reading queue cursor:', event.target.error);
-      reject(event.target.error);
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error reading queue cursor:', request.error);
+      reject!(request.error);
     };
   }
 
@@ -167,13 +184,13 @@ export class Queue {
    * The processing loop continually waits for the next
    * dbOperation to come using the following generator.
    */
-  async * nextDBOperation () {
+  private async * _nextDBOperation (): AsyncGenerator<DBOperation> {
     while (true) {
-      let operation;
+      let operation: DBOperation;
       if (this.dbOperationQueue.length > 0) {
-        operation = this.dbOperationQueue.shift();
+        operation = this.dbOperationQueue.shift()!;
       } else {
-        operation = await new Promise(resolve => {
+        operation = await new Promise<DBOperation>(resolve => {
           this.nextDBOperationPromise = resolve;
         });
       }
@@ -199,7 +216,7 @@ export class Queue {
   }
 
   // helper function for enqueue/dequeue
-  addItemToDBOperationQueue (payload) {
+  addItemToDBOperationQueue (payload: DBOperation) {
     if (this.nextDBOperationPromise) {
       this.nextDBOperationPromise(payload);
       this.nextDBOperationPromise = null;
@@ -212,7 +229,7 @@ export class Queue {
    * This functions will append an enqueue message to the
    * current operation stream.
    */
-  enqueue (item) {
+  enqueue (item: unknown) {
     debug.info(`idbQueue: Enqueuing item ${item}`);
     const payload = {
       operation: ENQUEUE,

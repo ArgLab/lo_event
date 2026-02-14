@@ -82,8 +82,8 @@ loEvent.init(
   debug.LEVEL.SIMPLE,
   [debug.LOG_OUTPUT.LOGGER(loEvent.logEvent), debug.LOG_OUTPUT.CONSOLE]
 );
-loEvent.setFieldSet([{ preauth_type: 'test' }]);
-loEvent.setFieldSet([{ postauth_type: 'test' }, getBrowserInfo()]);
+loEvent.lockFields([{ preauth_type: 'test' }]);
+loEvent.lockFields([{ postauth_type: 'test' }, getBrowserInfo()]);
 loEvent.go();
 
 loEvent.logEvent('test', { event_number: 1 });

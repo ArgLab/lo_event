@@ -7,7 +7,12 @@
  */
 
 export class Queue {
-  constructor (queueName) {
+  private queue: unknown[];
+  private queueName: string;
+  private promise: Promise<unknown> | null;
+  private resolve: ((value: unknown) => void) | null;
+
+  constructor (queueName: string) {
     this.queue = [];
     this.queueName = queueName;
     this.promise = null;
@@ -20,16 +25,16 @@ export class Queue {
   async initialize () {
   }
 
-  enqueue (item) {
+  enqueue (item: unknown) {
     if (this.promise) {
-      this.resolve(item);
+      this.resolve!(item);
       this.promise = null;
     } else {
       this.queue.push(item);
     }
   }
 
-  dequeue () {
+  dequeue (): unknown | Promise<unknown> {
     if (this.queue.length > 0) {
       return this.queue.shift();
     } else {

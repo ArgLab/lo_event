@@ -13,12 +13,13 @@ import { storage } from './browserStorage.js';
  *  console.log(copied)
  *  // expected output: { a: 1, b: 2 }
  */
-export function copyFields (source, fields) {
-  const result = {};
+export function copyFields(source: object | null | undefined, fields: string[]): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
   if (source) {
+    const obj = source as Record<string, unknown>;
     fields.forEach(field => {
-      if (field in source) {
-        result[field] = source[field];
+      if (field in obj) {
+        result[field] = obj[field];
       }
     });
   }
@@ -34,7 +35,7 @@ export function copyFields (source, fields) {
   Returns:
   str: A string representing the unique key, in the format "{prefix}-{randomUUID}-{timestamp}". If no prefix is provided, the format will be "{randomUUID}-{timestamp}".
   */
-export function keystamp (prefix) {
+export function keystamp (prefix?: string): string {
   return `${prefix ? prefix + '-' : ''}${uuidv4()}-${Date.now()}`;
   //  return `${prefix ? prefix + '-' : ''}${crypto.randomUUID()}-${Date.now()}`;
 }
@@ -54,7 +55,7 @@ export function keystamp (prefix) {
     // Expected output: ws://websocket.server/websocket/endpoint
     // See tests for more examples
   */
-export function fullyQualifiedWebsocketURL (defaultRelativeUrl, defaultBaseServer) {
+export function fullyQualifiedWebsocketURL (defaultRelativeUrl?: string, defaultBaseServer?: string): string {
   const relativeUrl = defaultRelativeUrl || '/wsapi/in';
   const baseServer = defaultBaseServer || (typeof document !== 'undefined' && document.location);
 
@@ -62,9 +63,9 @@ export function fullyQualifiedWebsocketURL (defaultRelativeUrl, defaultBaseServe
     throw new Error('Base server is not provided.');
   }
 
-  const url = new URL(relativeUrl, baseServer);
+  const url = new URL(relativeUrl, baseServer as string | URL);
 
-  const protocolMap = { 'https:': 'wss:', 'http:': 'ws:', 'ws:': 'ws:', 'wss:': 'wss:' };
+  const protocolMap: Record<string, string> = { 'https:': 'wss:', 'http:': 'ws:', 'ws:': 'ws:', 'wss:': 'wss:' };
 
   if (!protocolMap[url.protocol]) {
     throw new Error('Protocol mapping not found.');
@@ -75,9 +76,9 @@ export function fullyQualifiedWebsocketURL (defaultRelativeUrl, defaultBaseServe
   return url.href;
 }
 
-let cachedBrowserStamp = null;
+let cachedBrowserStamp: string | null = null;
 
-function browserStamp() {
+function browserStamp(): string {
   if (cachedBrowserStamp) {
     return cachedBrowserStamp;
   }
@@ -87,7 +88,7 @@ function browserStamp() {
   // Attempt to load a previously-stored stamp from storage (callback-based)
   storage.get([stampKey], (result) => {
     if (result[stampKey]) {
-      cachedBrowserStamp = result[stampKey];
+      cachedBrowserStamp = result[stampKey] as string;
     } else {
       storage.set({ [stampKey]: cachedBrowserStamp });
     }
@@ -106,7 +107,7 @@ let sessionStamp = keystamp();
 // bandwidth.
 let verboseEvents = true;
 
-export function setVerboseEvents(value) {
+export function setVerboseEvents(value: boolean): void {
   verboseEvents = value;
 }
 
@@ -117,18 +118,19 @@ export function setVerboseEvents(value) {
  *  event
  *  // { event: 'ADD', data: 'stuff', metadata: { ts, human_ts, iso_ts, sessionIndex, sessionTag } }
  */
-export function timestampEvent (event) {
+export function timestampEvent (event: Record<string, unknown>): void {
   if (!event.metadata) {
     event.metadata = {};
   }
 
-  event.metadata.iso_ts = new Date().toISOString();
+  const metadata = event.metadata as Record<string, unknown>;
+  metadata.iso_ts = new Date().toISOString();
   if(verboseEvents) {
-    event.metadata.ts = Date.now();
-    event.metadata.human_ts = Date();
-    event.metadata.sessionIndex = eventIndex++;
-    event.metadata.sessionTag = sessionStamp;
-    event.metadata.browserTag = browserStamp();
+    metadata.ts = Date.now();
+    metadata.human_ts = Date();
+    metadata.sessionIndex = eventIndex++;
+    metadata.sessionTag = sessionStamp;
+    metadata.browserTag = browserStamp();
   }
 }
 
@@ -142,9 +144,9 @@ export function timestampEvent (event) {
  *  console.log(debugMetadata);
  *  // Expected output: { logger_id: <unique_logger_id> }
  */
-export function fetchDebuggingIdentifier () {
-  return new Promise((resolve, reject) => {
-    const metadata = {};
+export function fetchDebuggingIdentifier (): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const metadata: Record<string, unknown> = {};
 
     storage.get(['logger_id', 'name'], (result) => {
       if (result.logger_id) {
@@ -174,14 +176,14 @@ export function fetchDebuggingIdentifier () {
  *  obj1
  *  // { a: 1, b: { c: 3, d: 4 }, e: 5 }
  */
-export function mergeDictionary (target, source) {
+export function mergeDictionary (target: Record<string, unknown>, source: Record<string, unknown>): void {
   for (const key in source) {
     if (
       Object.prototype.hasOwnProperty.call(target, key) &&
       typeof target[key] === 'object' && target[key] !== null &&
       typeof source[key] === 'object' && source[key] !== null
     ) {
-      mergeDictionary(target[key], source[key]);
+      mergeDictionary(target[key] as Record<string, unknown>, source[key] as Record<string, unknown>);
     } else {
       target[key] = source[key];
     }
@@ -202,9 +204,11 @@ export function mergeDictionary (target, source) {
  *  console.log(metadata);
  * // { browserInfo: {}, source: '0.0.1', metadata: { extra: 'extra data' }}
  */
-export async function mergeMetadata (inputList) {
+type MetadataInput = Record<string, unknown> | (() => Record<string, unknown> | Promise<Record<string, unknown>>);
+
+export async function mergeMetadata (inputList: MetadataInput[]): Promise<Record<string, unknown>> {
   // Initialize the master dictionary
-  const masterDict = {};
+  const masterDict: Record<string, unknown> = {};
 
   // Iterate over each item in the input list
   for (const item of inputList) {
@@ -231,7 +235,7 @@ export async function mergeMetadata (inputList) {
   return masterDict;
 }
 
-export function delay (ms) {
+export function delay (ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 const MS = 1;
@@ -242,7 +246,7 @@ const HOURS = 60 * MINS;
 export const TERMINATION_POLICY = {
   DIE: 'DIE',
   RETRY: 'RETRY'
-};
+} as const;
 
 /**
  * This function repeatedly tries to run another function
@@ -270,13 +274,13 @@ export const TERMINATION_POLICY = {
  * @returns returns when predicate is true or throws errorMessage
  */
 export async function backoff (
-  predicate,
+  predicate: () => unknown | Promise<unknown>,
   errorMessage = 'Could not resolve backoff function',
   // In milliseconds, time between retries until we fail.
   delays = [100 * MS, 1 * SECS, 10 * SECS, 1 * MINS, 5 * MINS, 30 * MINS],
-  terminationPolicy = TERMINATION_POLICY.DIE,
+  terminationPolicy: typeof TERMINATION_POLICY[keyof typeof TERMINATION_POLICY] = TERMINATION_POLICY.DIE,
   maxRetries = Infinity
-) {
+): Promise<true> {
   let retryCount = 0;
   while (true) {
     if (await predicate()) {
@@ -310,17 +314,17 @@ export async function backoff (
 // future, we might make this configurable or just switch, but for
 // now, we'd like to understand if this ever happens and make it very
 // obvious,
-export function once (func) {
+export function once<T extends (...args: any[]) => any>(func: T): T {
   let run = false;
-  return function () {
+  return function (this: unknown, ...args: any[]) {
     if (!run) {
       run = true;
-      return func.apply(this, arguments);
+      return func.apply(this, args);
     } else {
       console.log('>>>> Function called more than once. This should never happen <<<<');
       throw new Error('Error! Function was called more than once! This should never happen');
     }
-  };
+  } as T;
 }
 
 /*
@@ -341,19 +345,20 @@ export function once (func) {
   use the version from `lo_event`, and this should be removed from
   there.
 */
-export function treeget(tree, key) {
+export function treeget(tree: Record<string, unknown>, key: string): unknown {
   let keylist = key.split(".");
-  let subtree = tree;
+  let subtree: unknown = tree;
   for(var i=0; i<keylist.length; i++) {
     // Don't process empty subtrees
     if (subtree === null) {
       return null;
     }
+    const node = subtree as Record<string, unknown>;
     // If the next dotted element is present,
     // reset the subtree to only include that node
     // and its descendants.
-    if (keylist[i] in subtree) {
-      subtree = subtree[keylist[i]];
+    if (keylist[i] in node) {
+      subtree = node[keylist[i]];
     }
     // If a bracketed element is present, parse out
     // the index, grab the node at the index, and
@@ -364,9 +369,10 @@ export function treeget(tree, key) {
         const item = keylist[i].split('[')[0];
         const idx_orig = keylist[i].split('[')[1];
         const idx = idx_orig.split(']')[0];
-        if (item in subtree) {
-          if (subtree[item][idx] !== undefined) {
-            subtree =subtree[item][idx];
+        if (item in node) {
+          const arr = node[item] as Record<string, unknown>;
+          if (arr[idx] !== undefined) {
+            subtree = arr[idx];
           } else {
             return null;
           }
@@ -389,17 +395,17 @@ export function treeget(tree, key) {
  *
  * Will do things like omit hours (and perhaps be smarter in the future)
  */
-export function formatTime(seconds) {
+export function formatTime(seconds: number): string {
   // Calculate hours, minutes, and remaining seconds
   var hours = Math.floor(seconds / 3600);
   var minutes = Math.floor((seconds % 3600) / 60);
   var remainingSeconds = (seconds % 60).toFixed(2);
-  
+
   // Format hours, minutes, and remaining seconds to include leading zeros
   var formattedHours = hours.toString().padStart(2, '0');
   var formattedMinutes = minutes.toString().padStart(2, '0');
   var formattedSeconds = remainingSeconds.padStart(5, '0');
-  
+
   // Concatenate and return the formatted time
   if (hours > 0) {
     return `${formattedHours}:${formattedMinutes}:${formattedSeconds}`;
@@ -418,15 +424,15 @@ export function formatTime(seconds) {
  * When working in a browser, we want to dispatch the event via the
  * `window` object.
  */
-export function dispatchCustomEvent (eventName, detail) {
+export function dispatchCustomEvent (eventName: string, detail: CustomEventInit): void {
   const event = new CustomEvent(eventName, detail);
   if (typeof window !== 'undefined') {
     // Web page: dispatch directly on window
     window.dispatchEvent(event);
-  } else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+  } else if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
     // Chrome extension background script: use chrome.runtime to send messages
-    chrome.runtime.sendMessage({ eventName, detail }, (response) => {
-      if (chrome.runtime.lastError) {
+    chrome.runtime.sendMessage({ eventName, detail }, () => {
+      if (chrome.runtime?.lastError) {
         console.warn(`No listeners found for event, ${eventName}, in this context.`);
       }
     });
@@ -445,28 +451,29 @@ export function dispatchCustomEvent (eventName, detail) {
  * When working in a browser, it listens for events on the
  * `window` object.
  */
-export function consumeCustomEvent (eventName, callback) {
+export function consumeCustomEvent (eventName: string, callback: (detail: unknown, sender?: unknown) => void): () => void {
   if (typeof window !== 'undefined') {
     // Web page: listen for the event on the window object
-    const listener = (event) => {
+    const listener = (event: CustomEvent) => {
       callback(event.detail);
     };
-    window.addEventListener(eventName, listener);
+    window.addEventListener(eventName, listener as EventListener);
 
     // Return a function to remove the event listener
-    return () => window.removeEventListener(eventName, listener);
-  } else if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+    return () => window.removeEventListener(eventName, listener as EventListener);
+  } else if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     // Chrome extension background script: listen for messages via chrome.runtime
-    const listener = (message, sender, sendResponse) => {
-      if (message.eventName === eventName) {
-        callback(message.detail, sender);
+    const listener = (message: unknown, sender: unknown, sendResponse: (response?: unknown) => void) => {
+      const msg = message as Record<string, unknown>;
+      if (msg.eventName === eventName) {
+        callback(msg.detail, sender);
         sendResponse?.({ status: 'received' });
       }
     };
     chrome.runtime.onMessage.addListener(listener);
 
     // Return a function to remove the message listener
-    return () => chrome.runtime.onMessage.removeListener(listener);
+    return () => chrome.runtime!.onMessage!.removeListener(listener);
   } else {
     console.warn('Event consumption is not supported in this environment.');
     return () => {
@@ -485,7 +492,7 @@ export function consumeCustomEvent (eventName, callback) {
  *  7601   ==> 2h
  *  764450 ==> 8d
  */
-export function renderTime (t) {
+export function renderTime (t: number): string {
   const seconds = Math.floor(t) % 60;
   const minutes = Math.floor(t / 60) % 60;
   const hours = Math.floor(t / 3600) % 60;

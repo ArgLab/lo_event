@@ -23,18 +23,19 @@
 // At the end, we export one storage object, with a consistent API,
 // using our most reliable storage.
 import * as debug from './debugLog.js';
+import type { StorageBackend } from './types.js';
 
 // thunkStorage mirrors the capability of `chrome.storage.sync`
 // this is used for testing purposes, as well as a fallback if
 // chrome.storage.sync is unavailable.
-const thunkStorage = {
+const thunkStorage: StorageBackend & { data: Record<string, unknown> } = {
   data: {},
-  set: function (items, callback) {
+  set: function (items: Record<string, unknown>, callback?: () => void) {
     this.data = { ...this.data, ...items };
     if (callback) callback();
   },
-  get: function (keys, callback) {
-    let result = {};
+  get: function (keys: string | string[] | null, callback?: (result: Record<string, unknown>) => void) {
+    let result: Record<string, unknown> = {};
     if (Array.isArray(keys)) {
       keys.forEach(key => {
         if (Object.prototype.hasOwnProperty.call(this.data, key)) {
@@ -57,13 +58,13 @@ const thunkStorage = {
  * function to mirror the workflow and capabilities of the
  * `storage.sync.get`/`chrome.sync.get` API.
  */
-function getWithCallback (getItem) {
-  function get (items, callback = () => {}) {
+function getWithCallback (getItem: (key: string) => unknown): StorageBackend['get'] {
+  function get (items: string | string[] | null, callback: (result: Record<string, unknown>) => void = () => {}) {
     if (typeof items === 'string') {
       items = [items];
     }
-    const results = {};
-    for (const item of items) {
+    const results: Record<string, unknown> = {};
+    for (const item of items ?? []) {
       results[item] = getItem(item);
     }
     callback(results);
@@ -76,8 +77,8 @@ function getWithCallback (getItem) {
  * function to mirror the capabilities of the
  * `storage.sync.set`/`chrome.sync.set` API.
  */
-function setWithCallback (setItem) {
-  function set (items, callback = () => {}) {
+function setWithCallback (setItem: (key: string, value: unknown) => void): StorageBackend['set'] {
+  function set (items: Record<string, unknown>, callback: (() => void) = () => {}) {
     for (const item in items) {
       setItem(item, items[item]);
     }
@@ -86,9 +87,9 @@ function setWithCallback (setItem) {
   return set;
 }
 
-export let storage;
+export let storage: StorageBackend;
 
-let b;
+let b: typeof chrome | undefined;
 
 if (typeof browser !== 'undefined') {
   b = browser;
@@ -110,10 +111,10 @@ if (typeof browser !== 'undefined') {
 if (typeof b !== 'undefined') {
   if (b.storage && b.storage.sync) {
     debug.info('Setting storage to storage.sync');
-    storage = b.storage.sync;
+    storage = b.storage.sync as StorageBackend;
   } else if (b.storage && b.storage.local) {
     debug.info('Setting storage to storage.local');
-    storage = b.storage.local;
+    storage = b.storage.local as StorageBackend;
   } else {
     debug.info('Setting storage to default, thunkStorage');
     storage = thunkStorage;
@@ -123,14 +124,14 @@ if (typeof b !== 'undefined') {
   debug.info('Setting storage to localStorage');
   storage = {
     get: getWithCallback(localStorage.getItem.bind(localStorage)),
-    set: setWithCallback(localStorage.setItem.bind(localStorage))
+    set: setWithCallback((key, value) => localStorage.setItem(key, String(value)))
   };
 } else if (typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
   // Add compatibility modifications for window.localStorage
   debug.info('Setting storage to window.localStorage');
   storage = {
     get: getWithCallback(window.localStorage.getItem.bind(window.localStorage)),
-    set: setWithCallback(window.localStorage.setItem.bind(window.localStorage))
+    set: setWithCallback((key, value) => window.localStorage.setItem(key, String(value)))
   };
 } else {
   // If none of the above options exist, fall back to thunkStorage or exit gracefully

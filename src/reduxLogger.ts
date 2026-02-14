@@ -24,6 +24,22 @@ import { createStateSyncMiddleware, initMessageListener } from 'redux-state-sync
 import debounce from 'lodash/debounce.js';
 
 import * as util from './util.js';
+import type { Logger } from './types.js';
+
+declare global {
+  interface Window {
+    __REDUX_DEVTOOLS_EXTENSION_COMPOSE__?: typeof redux.compose;
+  }
+}
+
+interface ReduxAction {
+  redux_type: string;
+  type: string;
+  payload: unknown;
+}
+
+type StoreState = Record<string, unknown>;
+type ReducerFn = (state: StoreState, action: ReduxAction) => StoreState;
 
 const EMIT_EVENT = 'EMIT_EVENT';
 const EMIT_LOCKFIELDS = 'EMIT_LOCKFIELDS';
@@ -34,7 +50,7 @@ let IS_LOADED = false;
 // TODO: Import debugLog and use those functions.
 const DEBUG = false;
 
-function debug_log (...args) {
+function debug_log (...args: unknown[]) {
   if (DEBUG) {
     console.log(...args);
   }
@@ -45,16 +61,16 @@ function debug_log (...args) {
  * This is fired when consuming a custom `fetch_blob`
  * event.
  */
-export function handleLoadState (data) {
+export function handleLoadState (data: unknown) {
   IS_LOADED = true;
-  const state = store.getState();
+  const state = store.getState() as StoreState;
   if (data) {
     setState(
       {
         ...state,
         ...data,
         settings: {
-          ...state.settings,
+          ...(state.settings as Record<string, unknown>),
           reduxStoreStatus: IS_LOADED
         }
       });
@@ -64,21 +80,21 @@ export function handleLoadState (data) {
       {
         ...state,
         settings: {
-          ...state.settings,
+          ...(state.settings as Record<string, unknown>),
           reduxStoreStatus: IS_LOADED
         }
       });
   }
 }
 
-async function saveStateToLocalStorage (state) {
+async function saveStateToLocalStorage (state: StoreState) {
   if (!IS_LOADED) {
     debug_log('Not saving store locally because IS_LOADED is set to false.');
     return;
   }
 
   try {
-    const KEY = state?.settings?.reduxID || 'redux';
+    const KEY = (state?.settings as Record<string, unknown>)?.reduxID as string || 'redux';
     const serializedState = JSON.stringify(state);
     localStorage.setItem(KEY, serializedState);
   } catch (e) {
@@ -90,7 +106,7 @@ async function saveStateToLocalStorage (state) {
  * Dispatch a `save_blob` event on the redux
  * logger.
  */
-async function saveStateToServer (state) {
+async function saveStateToServer (state: StoreState) {
   if (!IS_LOADED) {
     debug_log('Not saving store on the server because IS_LOADED is set to false.');
     return;
@@ -112,7 +128,7 @@ async function saveStateToServer (state) {
 // `redux_type`. However, for debugging / logging tools
 // (e.g. redux-dev-tools), it was convenient to have this match up to
 // the internal event type.
-const emitEvent = (event) => {
+const emitEvent = (event: string): ReduxAction => {
   return {
     redux_type: EMIT_EVENT,
     type: JSON.parse(event).event,
@@ -121,7 +137,7 @@ const emitEvent = (event) => {
 };
 
 // Action creator function
-const emitSetField = (setField) => {
+const emitSetField = (setField: string): ReduxAction => {
   return {
     redux_type: EMIT_LOCKFIELDS,
     type: EMIT_LOCKFIELDS,
@@ -129,7 +145,7 @@ const emitSetField = (setField) => {
   };
 };
 
-const emitSetState = (state) => {
+const emitSetState = (state: StoreState): ReduxAction => {
   return {
     redux_type: EMIT_SET_STATE,
     type: EMIT_SET_STATE,
@@ -137,18 +153,18 @@ const emitSetState = (state) => {
   };
 };
 
-function store_last_event_reducer (state = {}, action) {
+function store_last_event_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
   return { ...state, event: action.payload };
-};
+}
 
-function lock_fields_reducer (state = {}, action) {
-  const payload = JSON.parse(action.payload);
+function lock_fields_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
+  const payload = JSON.parse(action.payload as string);
   return {
     ...state,
     lock_fields: {
       ...payload,
       fields: {
-        ...(state.lock_fields ? state.lock_fields.fields : {}),
+        ...((state.lock_fields as Record<string, unknown>)?.fields as Record<string, unknown> || {}),
         ...payload.fields
       }
     }
@@ -166,13 +182,14 @@ function lock_fields_reducer (state = {}, action) {
  *
  * Ergo, the two-level call with the destruct.
  */
-export const updateComponentStateReducer = ({}) => (state = {}, action) => {
+export const updateComponentStateReducer = ({}: Record<string, unknown>) => (state: StoreState = {}, action: Record<string, unknown>): StoreState => {
   const { id, ...rest } = action;
+  const component_state = (state.component_state || {}) as Record<string, Record<string, unknown>>;
   const new_state = {
     ...state,
     component_state: {
-      ...state.component_state,
-      [id]: {...state.component_state?.[id], ...rest}
+      ...component_state,
+      [id as string]: {...component_state?.[id as string], ...rest}
     }
   };
 
@@ -188,19 +205,19 @@ export const updateComponentStateReducer = ({}) => (state = {}, action) => {
   return new_state;
 }
 
-function set_state_reducer (state = {}, action) {
-  return action.payload;
+function set_state_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
+  return action.payload as StoreState;
 }
 
-const BASE_REDUCERS = {
+const BASE_REDUCERS: Record<string, ReducerFn[]> = {
   [EMIT_EVENT]: [store_last_event_reducer],
   [EMIT_LOCKFIELDS]: [lock_fields_reducer],
   [EMIT_SET_STATE]: [set_state_reducer]
 }
 
-const APPLICATION_REDUCERS = {};
+const APPLICATION_REDUCERS: Record<string, ReducerFn[]> = {};
 
-export const registerReducer = (keys, reducer) => {
+export const registerReducer = (keys: string | string[], reducer: ReducerFn) => {
   const reducerKeys = Array.isArray(keys) ? keys : [keys];
 
   reducerKeys.forEach(key => {
@@ -214,19 +231,19 @@ export const registerReducer = (keys, reducer) => {
 };
 
 // Reducer function
-const reducer = (state = {}, action) => {
+const reducer = (state: StoreState = {}, action: ReduxAction): StoreState => {
   let payload;
 
   debug_log('Reducing ', action, ' on ', state);
   state = BASE_REDUCERS[action.redux_type] ? composeReducers(...BASE_REDUCERS[action.redux_type])(state, action) : state;
 
   if (action.redux_type === EMIT_EVENT) {
-    payload = JSON.parse(action.payload);
+    payload = JSON.parse(action.payload as string);
     if (action.type === 'save_setting') {
       return {
         ...state,
         settings: {
-          ...state.settings,
+          ...(state.settings as Record<string, unknown>),
           payload
         }
       };
@@ -234,14 +251,14 @@ const reducer = (state = {}, action) => {
     debug_log(Object.keys(payload));
 
     if (APPLICATION_REDUCERS[payload.event]) {
-      state = { ...state, application_state: composeReducers(...APPLICATION_REDUCERS[payload.event])(state.application_state || {}, payload) };
+      state = { ...state, application_state: composeReducers(...APPLICATION_REDUCERS[payload.event])((state.application_state || {}) as StoreState, payload) };
     }
   }
 
   return state;
 };
 
-const eventQueue = [];
+const eventQueue: unknown[] = [];
 const composeEnhancers = (typeof window !== 'undefined' && window.__REDUX_DEVTOOLS_EXTENSION_COMPOSE__) || redux.compose;
 
 // This should just be redux.applyMiddleware(thunk))
@@ -251,18 +268,18 @@ const composeEnhancers = (typeof window !== 'undefined' && window.__REDUX_DEVTOO
 // back to thunk.
 // const presistedState = loadState();
 
-export let store = redux.createStore(
-  reducer,
-  { event: null }, // Base state
-  composeEnhancers(redux.applyMiddleware((thunk.default || thunk), createStateSyncMiddleware()))
+export let store: redux.Store<Record<string, unknown>> = redux.createStore(
+  reducer as unknown as redux.Reducer<Record<string, unknown>>,
+  { event: null } as unknown as Record<string, unknown>, // Base state
+  composeEnhancers(redux.applyMiddleware(((thunk as any).default || thunk) as redux.Middleware, createStateSyncMiddleware() as redux.Middleware))
 );
 
 initMessageListener(store);
 
-let promise = null;
-let previousEvent = null;
-let lockFields = null;
-let eventSubscribers = [];
+let promise: (Promise<unknown> & { resolve?: (value: unknown) => void }) | null = null;
+let previousEvent: unknown = null;
+let lockFields: Record<string, unknown> | null = null;
+let eventSubscribers: Array<(event: unknown) => void> = [];
 
 /*
   Compose reducers takes a dynamic number of reducers as arguments and
@@ -276,56 +293,56 @@ let eventSubscribers = [];
   const finalState = rootReducer(initialState, { redux_type: 'SOME_ACTION' });
   ```
 */
-function composeReducers(...reducers) {
+function composeReducers(...reducers: ReducerFn[]): ReducerFn {
   return (state, action) => reducers.reduce(
     (currentState, reducer) => reducer(currentState, action),
     state
   );
 }
 
-export function setState(state) {
+export function setState(state: StoreState) {
   debug_log('Set state called');
   if (Object.keys(state).length === 0) {
-    const storeState = store.getState();
+    const storeState = store.getState() as StoreState;
     state = {
       settings: {
-        ...storeState.settings,
+        ...(storeState.settings as Record<string, unknown>),
         reduxStoreStatus: IS_LOADED
       }
     };
   }
-  store.dispatch(emitSetState(state));
+  store.dispatch(emitSetState(state) as unknown as redux.Action);
 }
 
-const debouncedSaveStateToLocalStorage = debounce((state) => {
+const debouncedSaveStateToLocalStorage = debounce((state: StoreState) => {
   saveStateToLocalStorage(state);
 }, 1000);
 
-const debouncedSaveStateToServer = debounce((state) => {
+const debouncedSaveStateToServer = debounce((state: StoreState) => {
   saveStateToServer(state);
 }, 1000);
 
 function initializeStore () {
   store.subscribe(() => {
-    const state = store.getState();
+    const state = store.getState() as StoreState;
     // we use debounce to save the state once every second
     // for better performances in case multiple changes occur in a short time
     debouncedSaveStateToLocalStorage(state);
     debouncedSaveStateToServer(state);
 
     if (state.lock_fields) {
-      lockFields = state.lock_fields.fields;
+      lockFields = (state.lock_fields as Record<string, unknown>).fields as Record<string, unknown>;
     }
     if (!state.event) return;
     debug_log('Received event:', state.event);
-    const event = JSON.parse(state.event);
+    const event = JSON.parse(state.event as string);
     if (event === previousEvent) {
       return;
     }
     previousEvent = event;
 
     if (promise) {
-      promise.resolve(event);
+      promise.resolve!(event);
       promise = null;
     } else {
       // This is only useful for awaitEvent below. Otherwise, events build up. Having
@@ -339,14 +356,14 @@ function initializeStore () {
   });
 }
 
-export function reduxLogger (subscribers, initialState = null) {
+export function reduxLogger (subscribers?: Array<(event: unknown) => void>, initialState: StoreState | null = null): Logger {
   if (subscribers != null) {
     eventSubscribers = subscribers;
   }
 
-  function logEvent (event) {
-    store.dispatch(emitEvent(event));
-  }
+  const logEvent: Logger = function (event: string) {
+    store.dispatch(emitEvent(event) as unknown as redux.Action);
+  };
   logEvent.lo_name = 'Redux Logger'; // A human-friendly name for the logger
   logEvent.lo_id = 'redux_logger';   // A machine-frienly name for the logger
 
@@ -354,8 +371,8 @@ export function reduxLogger (subscribers, initialState = null) {
     initializeStore();
   };
 
-  logEvent.setField = function (event) {
-    store.dispatch(emitSetField(event));
+  logEvent.setField = function (event: string) {
+    store.dispatch(emitSetField(event) as unknown as redux.Action);
   };
 
   logEvent.getLockFields = function () { return lockFields; };
@@ -372,7 +389,7 @@ export function reduxLogger (subscribers, initialState = null) {
 // Note that this should not be used in threaded code or in multiple
 // places at the same time in async code. It's a convenience function
 // for _simple_ code.
-export const awaitEvent = () => {
+export const awaitEvent = (): unknown => {
   if (eventQueue.length > 0) {
     return eventQueue.shift(); // Return the first event in the queue
   }
@@ -381,13 +398,13 @@ export const awaitEvent = () => {
   }
 
   // Create a new promise
-  let resolvePromise;
+  let resolvePromise: (value: unknown) => void;
 
   promise = new Promise((resolve) => {
     resolvePromise = resolve;
   });
 
-  promise.resolve = resolvePromise;
+  promise.resolve = resolvePromise!;
   return promise;
 };
 

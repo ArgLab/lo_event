@@ -1,22 +1,28 @@
 import { treeget, copyFields } from './util.js';
 
-function selectionData(event) {
-  return window.getSelection().toString();
+interface BrowserEventDescriptor {
+  parent?: string[];
+  properties?: string[];
+  functions?: Record<string, (event: Event) => unknown>;
 }
 
-function windowSize(event){
+function selectionData(event: Event): string {
+  return window.getSelection()!.toString();
+}
+
+function windowSize(event: Event): { h: number; w: number } {
   return { h: window.innerHeight, w: window.innerWidth };
 }
 
-function mediaInfo(event){
-  if(event.video) {
-    return copyFields(event.video, ["src", "width", "height", "duration", "currentTime", "muted", "paused", "controls"]);
+function mediaInfo(event: Event): Record<string, unknown> | null {
+  if((event as unknown as Record<string, unknown>).video) {
+    return copyFields((event as unknown as Record<string, unknown>).video as Record<string, unknown>, ["src", "width", "height", "duration", "currentTime", "muted", "paused", "controls"]);
   } else {
     return null;
   }
 }
 
-let parent_events = {
+const parent_events: Record<string, BrowserEventDescriptor> = {
   generic: {properties: ["timeStamp", "type"]},
   animation: {parent: ["generic"], properties: ["animationName", "elapsedTime", "pseudoElement"]},
   clipboard: {parent: ["generic"]},
@@ -28,11 +34,11 @@ let parent_events = {
   touch: {parent: ["mouse"], properties: ["changedTouches", "targetTouches", "touches", "rotation", "scale"]}, // Rotation / scale are nonstandard, but helpful where they work.
   transition: {parent: ["generic"], properties: ["propertyName", "elapsedTime", "pseudoElement"]},
   media: {parent: ["generic"], functions: { mediaInfo }},
-};
+} as const satisfies Record<string, BrowserEventDescriptor>;
 
 // TODO: Find some way to either aggregate or debounce dense events like mouseMove, seeks, etc.
 // These can occur many times in each second, and naively treated, they will overwhelm the server.
-let events = {
+const events: Record<string, BrowserEventDescriptor & { debounce?: boolean }> = {
   // Key events (done)
   keydown: {parent: ["key"]},
   keypress: {parent: ["key"]},
@@ -46,7 +52,7 @@ let events = {
   // Clipboard events (done, but we don't log data for cut)
   cut: {parent: ["clipboard"]},
   copy: {parent: ["clipboard"], functions: {selectionData}},
-  paste: {parent: ["clipboard"], functions: {clipboardData : (event) => event.clipboardData.getData('text')}},
+  paste: {parent: ["clipboard"], functions: {clipboardData : (event: Event) => (event as ClipboardEvent).clipboardData!.getData('text')}},
 
   // Drag-and-drop events (probably done, but we may want to extract dataTransfer, and untested)
 //  drag: {parent: "mouse", properties: [], functions: {}}, <-- Large number of events
@@ -121,7 +127,7 @@ let events = {
   show: {parent: ["generic"]}, // context menu
   // Scroll
   //  scroll: {parent: ["generic"]}, // Massive number of events. These sorts of events should be debounced, perhaps.
-  scrollend: {parent: ["generic"], properties: [], functions: {}},  
+  scrollend: {parent: ["generic"], properties: [], functions: {}},
 
   // Form / input-style elements
   change: {parent: ["generic"]}, // <input> changed. Typically when unfocused
@@ -145,7 +151,7 @@ let events = {
   fullscreenerror: {parent: ["generic"]},
   offline: {parent: ["generic"]},
   online: {parent: ["generic"]},
-  visibilitychange: {parent: ["generic"], functions: {visibility: (event) => document.visibilityState}},
+  visibilitychange: {parent: ["generic"], functions: {visibility: (event: Event) => document.visibilityState}},
   deviceorientation:  {parent: ["generic"]},
 
   // Element focus (probably done)
@@ -160,7 +166,7 @@ let events = {
   appinstalled: {parent: ["generic"]},
   beforeinstallprompt: {parent: ["generic"]},
   // Selection
-  select: {parent: ["generic"], functions: { selectionStart: (event) => event.target.selectionStart, selectionEnd: (event) => event.target.selectionEnd, selectionData }},
+  select: {parent: ["generic"], functions: { selectionStart: (event: Event) => (event.target as HTMLInputElement).selectionStart, selectionEnd: (event: Event) => (event.target as HTMLInputElement).selectionEnd, selectionData }},
   selectionchange: {parent: ["generic"], functions: { selectionData }},
 
   // Uncategorized
@@ -168,7 +174,7 @@ let events = {
 //  open: {parent: ["generic"], properties: [], functions: {}}, <-- We want to avoid the possibility of infinite loops
 //  resize: {parent: ["generic"], functions: { windowSize }},  <-- This would be helpful with a debounce, so we have the final resize
 
-}
+};
 
 
 /*
@@ -176,8 +182,8 @@ let events = {
  */
 
 // Helper for building event property list
-function compileEventProperties(event) {
-  let properties = [];
+function compileEventProperties(event: BrowserEventDescriptor): string[] {
+  let properties: string[] = [];
   if (event.parent) {
     event.parent.forEach((parentEvent) => {
       properties = properties.concat(compileEventProperties(parent_events[parentEvent]));
@@ -190,8 +196,8 @@ function compileEventProperties(event) {
 }
 
 // Helper for building event function dictionary
-function compileEventFunctions(event) {
-  let functions = {};
+function compileEventFunctions(event: BrowserEventDescriptor): Record<string, (event: Event) => unknown> {
+  let functions: Record<string, (event: Event) => unknown> = {};
   if (event.parent) {
     event.parent.forEach((parentEvent) => {
       functions = { ...functions, ...compileEventFunctions(parent_events[parentEvent]) };
@@ -202,10 +208,10 @@ function compileEventFunctions(event) {
 }
 
 // Helper for building event function list
-function compileEvent(event) {
+function compileEvent(event: BrowserEventDescriptor): { properties: string[]; functions: Record<string, (event: Event) => unknown> } {
   const properties = compileEventProperties(event);
   const functions = compileEventFunctions(event);
-  
+
   return { properties, functions };
 }
 
@@ -214,10 +220,10 @@ function compileEvent(event) {
  */
 
 // This grabs information about an element on a page, typically an event target.
-function targetInfo(target) {
-  let fields = copyFields(target, ["className", "nodeType", "localName", "tagName", "nodeName", "id", "value"]);
-  if(target.classList) {
-    fields.classlist = Array.from(target.classList);
+function targetInfo(target: EventTarget): Record<string, unknown> {
+  let fields: Record<string, unknown> = copyFields(target as unknown as Record<string, unknown>, ["className", "nodeType", "localName", "tagName", "nodeName", "id", "value"]);
+  if((target as Element).classList) {
+    fields.classlist = Array.from((target as Element).classList);
   }
 
   return fields;
@@ -225,7 +231,7 @@ function targetInfo(target) {
 
 // This copies information about the targets and elements related to
 // an event into a dictionary.
-function copyTargets(event) {
+function copyTargets(event: Event): Record<string, Record<string, unknown>> {
   // These are the potential elements associated with an event
   // This is very redundant, but most of the redundancy disappears with compression.
   // We should consider scaling this back if these are identical, however, just for readability
@@ -235,28 +241,28 @@ function copyTargets(event) {
     "srcElement",
     "view",
     "relatedTarget"
-  ];
+  ] as const;
 
-  let compiledTargets = {};   // The information we return
-  let uncompiledTargets = {}; // The actual target object themselves
+  const compiledTargets: Record<string, Record<string, unknown>> = {};   // The information we return
+  const uncompiledTargets: Record<string, EventTarget> = {}; // The actual target object themselves
 
   // For each candidate target which exists....
   targets.forEach((targetKey) => {
-    if (event[targetKey]) {
+    if ((event as unknown as Record<string, unknown>)[targetKey]) {
       // Check if we've already processed it
       let duplicateKeys = Object.keys(uncompiledTargets).filter(key => {
-        return uncompiledTargets[key] === event[targetKey];
+        return uncompiledTargets[key] === (event as unknown as Record<string, unknown>)[targetKey];
       });
       // If so, we just add it to our list of duplicates
       if (duplicateKeys.length > 0) {
         if(!compiledTargets[duplicateKeys[0]].dupes) {
           compiledTargets[duplicateKeys[0]].dupes = [];
         }
-        compiledTargets[duplicateKeys[0]].dupes.push(targetKey);
+        (compiledTargets[duplicateKeys[0]].dupes as string[]).push(targetKey);
       // Otherwise, we include it in the main dictionary.
       } else {
-        uncompiledTargets[targetKey] = event[targetKey];
-        compiledTargets[targetKey] = targetInfo(event[targetKey]);
+        uncompiledTargets[targetKey] = (event as unknown as Record<string, unknown>)[targetKey] as EventTarget;
+        compiledTargets[targetKey] = targetInfo((event as unknown as Record<string, unknown>)[targetKey] as EventTarget);
       }
     }
   });
@@ -264,14 +270,14 @@ function copyTargets(event) {
   return compiledTargets;
 }
 
-export function lo_event_name(event) {
-  return `browser.${events[event.type].parent[0]}.${event.type}`;
+export function lo_event_name(event: Event): string {
+  return `browser.${events[event.type].parent![0]}.${event.type}`;
 }
 
-export function lo_event_props(event) {
+export function lo_event_props(event: Event): Record<string, unknown> {
   const { properties, functions } = compileEvent(events[event.type]);
   const copiedProperties = copyFields(event, properties);
-  let props = {...copiedProperties, ...copyTargets(event)};
+  let props: Record<string, unknown> = {...copiedProperties, ...copyTargets(event)};
   for (const f in functions) {
     const d = functions[f](event);
     if(d) {
@@ -281,19 +287,19 @@ export function lo_event_props(event) {
   return props;
 }
 
-function debounce(func, wait) {
+function debounce(func: unknown, wait: unknown): void {
   // TODO
 }
 
-function eventListener(dispatch) {
-  return function(event) {
+function eventListener(dispatch: (eventType: string, lodict: Record<string, unknown>) => void): (event: Event) => void {
+  return function(event: Event) {
     const eventType = lo_event_name(event);
     const browser_props = lo_event_props(event);
 
-    const lodict = {
+    const lodict: Record<string, unknown> = {
       browser_props
     };
-    if (events[event.type].debounce) {
+    if ((events[event.type] as Record<string, unknown>).debounce) {
       lodict.debounced = true;
       debounce(
         eventType,
@@ -305,7 +311,7 @@ function eventListener(dispatch) {
   };
 }
 
-export function subscribeToEvents({ target = document, eventList = events, dispatch=console.log } = {}) {
+export function subscribeToEvents({ target = document as EventTarget, eventList = events, dispatch = console.log as (eventType: string, lodict: Record<string, unknown>) => void } = {}): void {
   for (let key in eventList) {
     target.addEventListener(key, eventListener(dispatch));
   }
