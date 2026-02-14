@@ -64,7 +64,7 @@ export function fullyQualifiedWebsocketURL (defaultRelativeUrl, defaultBaseServe
 
   const url = new URL(relativeUrl, baseServer);
 
-  const protocolMap = { 'https:': 'wss:', 'http:': 'ws:', 'ws:': 'ws:', 'wss:': 'wss' };
+  const protocolMap = { 'https:': 'wss:', 'http:': 'ws:', 'ws:': 'ws:', 'wss:': 'wss:' };
 
   if (!protocolMap[url.protocol]) {
     throw new Error('Protocol mapping not found.');
@@ -75,17 +75,24 @@ export function fullyQualifiedWebsocketURL (defaultRelativeUrl, defaultBaseServe
   return url.href;
 }
 
+let cachedBrowserStamp = null;
+
 function browserStamp() {
-  const stampKey = 'loBrowserStamp'; // Key to store the browser stamp
-  let stamp = storage.get(stampKey);
-
-  if (!stamp) {
-    // Generate and store browser stamp if not found
-    stamp = keystamp();
-    storage.set({stampKey: stamp});
+  if (cachedBrowserStamp) {
+    return cachedBrowserStamp;
   }
-
-  return stamp;
+  // Generate a stamp immediately so we can return synchronously
+  cachedBrowserStamp = keystamp();
+  const stampKey = 'loBrowserStamp';
+  // Attempt to load a previously-stored stamp from storage (callback-based)
+  storage.get([stampKey], (result) => {
+    if (result[stampKey]) {
+      cachedBrowserStamp = result[stampKey];
+    } else {
+      storage.set({ [stampKey]: cachedBrowserStamp });
+    }
+  });
+  return cachedBrowserStamp;
 }
 
 let eventIndex = 0; // Initialize index counter
@@ -304,9 +311,10 @@ export async function backoff (
 // now, we'd like to understand if this ever happens and make it very
 // obvious,
 export function once (func) {
-  const run = false;
+  let run = false;
   return function () {
     if (!run) {
+      run = true;
       return func.apply(this, arguments);
     } else {
       console.log('>>>> Function called more than once. This should never happen <<<<');
@@ -355,7 +363,7 @@ export function treeget(tree, key) {
       if (keylist[i] && keylist[i].indexOf('[')>0) {
         const item = keylist[i].split('[')[0];
         const idx_orig = keylist[i].split('[')[1];
-        const idx = idx.split(']')[0];
+        const idx = idx_orig.split(']')[0];
         if (item in subtree) {
           if (subtree[item][idx] !== undefined) {
             subtree =subtree[item][idx];

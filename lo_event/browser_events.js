@@ -10,7 +10,7 @@ function windowSize(event){
 
 function mediaInfo(event){
   if(event.video) {
-    return copyFields(event.video, ["src", "width", "height", "duration", "currentRime", "muted", "paused", "controls"]);
+    return copyFields(event.video, ["src", "width", "height", "duration", "currentTime", "muted", "paused", "controls"]);
   } else {
     return null;
   }
@@ -22,7 +22,7 @@ let parent_events = {
   clipboard: {parent: ["generic"]},
   composition: {parent: ["generic"], properties: ["data", "locale"]},
   key: {parent: ["generic"], properties: ["altKey", "charCode", "code", "ctrlKey", "iscomposing", "key", "keyCode", "metaKey", "repeat", "shiftKey", "timeStamp", "type", "which"], functions: {}},
-  mouse: {parent: ["generic"], properties: ["x", "y", "layerX", "layerY", "movementX", "movementY", "offsetY", "offsetY", "pageX", "pageY", "screenX", "screenY", "altKey", "metaKey", "shiftKey"]},
+  mouse: {parent: ["generic"], properties: ["x", "y", "layerX", "layerY", "movementX", "movementY", "offsetX", "offsetY", "pageX", "pageY", "screenX", "screenY", "altKey", "metaKey", "shiftKey"]},
   pointer: {parent: ["mouse"], properties: ["altitudeAngle", "azimuthAngle", "pointerId", "width", "height", "pressure", "tangentialPressure", "tiltX", "tiltY", "twist", "pointerType", "isPrimary"]},
   scroll: {parent: ["generic"], properties: ["detail", "layerX", "layerY", "which", "rangeOffset", "SCROLL_PAGE_UP", "SCROLL_PAGE_DOWN"]},
   touch: {parent: ["mouse"], properties: ["changedTouches", "targetTouches", "touches", "rotation", "scale"]}, // Rotation / scale are nonstandard, but helpful where they work.
@@ -50,12 +50,12 @@ let events = {
 
   // Drag-and-drop events (probably done, but we may want to extract dataTransfer, and untested)
 //  drag: {parent: "mouse", properties: [], functions: {}}, <-- Large number of events
-  dragend: {parent: "mouse", properties: [], functions: {}},
-  dragenter: {parent: "mouse", properties: [], functions: {}},
-  dragleave: {parent: "mouse", properties: [], functions: {}},
-//  dragover: {parent: "mouse", properties: [], functions: {}},
-  dragstart: {parent: "mouse", properties: [], functions: {}},
-  drop: {parent: "mouse", properties: [], functions: {}},
+  dragend: {parent: ["mouse"], properties: [], functions: {}},
+  dragenter: {parent: ["mouse"], properties: [], functions: {}},
+  dragleave: {parent: ["mouse"], properties: [], functions: {}},
+//  dragover: {parent: ["mouse"], properties: [], functions: {}},
+  dragstart: {parent: ["mouse"], properties: [], functions: {}},
+  drop: {parent: ["mouse"], properties: [], functions: {}},
 
   // Animations, videos, media, etc.
   // Animation (done)

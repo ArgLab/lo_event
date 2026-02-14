@@ -21,7 +21,7 @@
 import * as redux from 'redux';
 import { thunk } from 'redux-thunk';
 import { createStateSyncMiddleware, initMessageListener } from 'redux-state-sync';
-import debounce from 'lodash/debounce';
+import debounce from 'lodash/debounce.js';
 
 import * as util from './util.js';
 
@@ -166,7 +166,7 @@ function lock_fields_reducer (state = {}, action) {
  *
  * Ergo, the two-level call with the destruct.
  */
-export const updateComponentStateReducer = ({}) => (state = initialState, action) => {
+export const updateComponentStateReducer = ({}) => (state = {}, action) => {
   const { id, ...rest } = action;
   const new_state = {
     ...state,
