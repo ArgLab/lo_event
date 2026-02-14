@@ -88,7 +88,7 @@ export function error (log, error) {
   const formattedLog = formatLog(log);
   const errorString = (typeof error === 'string' ? error : (error && error.name ? error.name : "Error"));
   for (const logDestination of debugLogOutputs) {
-    logDestination(errorString, formattedLog, error.stack);
+    logDestination(errorString, formattedLog, error && error.stack);
   }
 }
 

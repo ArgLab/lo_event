@@ -26,6 +26,9 @@ let currentState = new Promise((resolve, reject) => { resolve(); }); // promise 
 
 let loggersEnabled = []; // A list of all loggers which should receive events.
 let queue;
+let pendingSource;
+let pendingVersion;
+let pendingMetadata = [];
 
 function isInitialized () {
   return initialized === INIT_STATES.READY;
@@ -141,10 +144,10 @@ export function init (
 
   loggersEnabled = loggers;
   initialized = INIT_STATES.IN_PROGRESS;
-  currentState = currentState
-    .then(initializeLoggers)
-    .then(() => setFieldSet([{ source, version }]))
-    .then(() => compileMetadata(metadata));
+  pendingSource = source;
+  pendingVersion = version;
+  pendingMetadata = metadata;
+  currentState = currentState.then(initializeLoggers);
   if(sendBrowserInfo) {
     // In the future, some or all of this might be sent on every
     // reconnect
@@ -152,7 +155,22 @@ export function init (
   }
 }
 
+/**
+ * Begin dequeuing and streaming events.
+ *
+ * This should be called after init() and any preauth setFieldSet()
+ * calls. Source/version and metadata are sent here so that preauth
+ * fields (set between init() and go()) are transmitted first.
+ *
+ * Typical usage:
+ *   lo_event.init(source, version, loggers, options);
+ *   lo_event.setFieldSet([{ preauth_type: 'test' }]);   // sent first
+ *   lo_event.setFieldSet([{ postauth: 'data' }]);       // sent second
+ *   lo_event.go();  // source/version sent here, then streaming begins
+ */
 export function go () {
+  setFieldSet([{ source: pendingSource, version: pendingVersion }]);
+  compileMetadata(pendingMetadata);
   currentState.then(() => {
     initialized = INIT_STATES.READY;
     queue.startDequeueLoop({

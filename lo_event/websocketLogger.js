@@ -107,12 +107,6 @@ export function websocketLogger (server = {}) {
     if(Object.keys(metadata).length > 0) {
       queue.enqueue(JSON.stringify(metadata));
     }
-
-    queue.startDequeueLoop({
-      initialize: waitForWSReady,
-      shouldDequeue: waitForWSReady,
-      onDequeue: socketSend
-    });
   }
 
   async function socketSend (item) {
@@ -120,7 +114,12 @@ export function websocketLogger (server = {}) {
   }
 
   async function waitForWSReady () {
-    return await util.backoff(() => (READY));
+    return await util.backoff(
+      () => (READY),
+      'WebSocket not ready',
+      undefined,
+      util.TERMINATION_POLICY.RETRY
+    );
   }
 
   function receiveMessage (event) {
@@ -136,7 +135,7 @@ export function websocketLogger (server = {}) {
         break;
       case 'auth':
         storage.set({ user_id: response.user_id });
-        util.dispatchCustomEvent('auth', { detail: { user_id: response.user } });
+        util.dispatchCustomEvent('auth', { detail: { user_id: response.user_id } });
         break;
       // These should probably be behind a feature flag, as they assume
       // we trust the server.
@@ -179,6 +178,11 @@ export function websocketLogger (server = {}) {
       WSLibrary = WebSocket;
     }
     startWebsocketConnectionLoop();
+    queue.startDequeueLoop({
+      initialize: waitForWSReady,
+      shouldDequeue: waitForWSReady,
+      onDequeue: socketSend
+    });
   };
 
   wsLogData.setField = function (data) {
