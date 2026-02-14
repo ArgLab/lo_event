@@ -58,14 +58,22 @@ export class Queue {
   async initialize () {
     let request;
     if (typeof indexedDB === 'undefined') {
-      debug.info('idbQueue: Importing indexedDB compatibility');
-
-      const sqlite3 = await import('sqlite3');
-      const indexeddbjs = await import('indexeddb-js');
-
-      const engine = new sqlite3.default.Database('queue.sqlite');
-      const scope = indexeddbjs.makeScope('sqlite3', engine);
-      request = scope.indexedDB.open(this.queueName);
+      // Node.js persistent queue is not yet supported.
+      // The sqlite3/indexeddb-js fallback was broken (autoIncrement
+      // unsupported, keys returned out of order) and the imports
+      // break browser bundlers. Use QueueType.IN_MEMORY for now.
+      //
+      // To restore Node support, install sqlite3 and indexeddb-js
+      // and uncomment:
+      //   const sqlite3 = await import('sqlite3');
+      //   const indexeddbjs = await import('indexeddb-js');
+      //   const engine = new sqlite3.default.Database('queue.sqlite');
+      //   const scope = indexeddbjs.makeScope('sqlite3', engine);
+      //   request = scope.indexedDB.open(this.queueName);
+      throw new Error(
+        'IndexedDB is not available in this environment. ' +
+        'Use QueueType.IN_MEMORY for Node.js.'
+      );
     } else {
       debug.info('idbQueue: Using browser consoleDB');
       request = indexedDB.open(this.queueName, 1);

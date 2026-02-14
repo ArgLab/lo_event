@@ -3,6 +3,7 @@
   "version": "0.0.3",
   "description": "Event logging library for the Learning Observer",
   "main": "src/loEvent.js",
+  "files": ["src/", "README.md", "LICENSE.TXT"],
   "exports": {
     ".": "./src/loEvent.js",
     "./redux": "./src/reduxLogger.js",
@@ -34,35 +35,16 @@
   "homepage": "https://github.com/ArgLab/lo_event#readme",
   "type": "module",
   "dependencies": {
-    "debounce": "^2.2.0",
-    "indexeddb-js": "^0.0.14",
     "lodash": "^4.17.21",
-    "sqlite3": "^5.1.6",
+    "redux": "^5.0.1",
+    "redux-state-sync": "^3.1.4",
+    "redux-thunk": "^3.1.0",
     "uuid": "^10.0.0",
     "ws": "^8.14.2"
   },
-  "peerDependencies": {
-    "react": "^18.0.0",
-    "react-dom": "^18.0.0",
-    "redux": "^5.0.0",
-    "redux-state-sync": "^3.1.0",
-    "redux-thunk": "^3.1.0"
-  },
-  "peerDependenciesMeta": {
-    "react": { "optional": true },
-    "react-dom": { "optional": true },
-    "redux": { "optional": true },
-    "redux-state-sync": { "optional": true },
-    "redux-thunk": { "optional": true }
-  },
   "devDependencies": {
     "vitest": "^3.0.0",
-    "parcel": "^2.12.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "redux": "^5.0.1",
-    "redux-state-sync": "^3.1.4",
-    "redux-thunk": "^3.1.0"
+    "parcel": "^2.12.0"
   },
   "browser": {
     "fs": false
