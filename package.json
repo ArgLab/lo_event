@@ -1,6 +1,6 @@
 {
-  "name": "lo-event",
-  "version": "0.0.4",
+  "name": "lo_event",
+  "version": "0.0.4-alpha.0",
   "description": "Event logging library for the Learning Observer",
   "main": "dist/loEvent.js",
   "types": "dist/loEvent.d.ts",
