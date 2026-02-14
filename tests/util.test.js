@@ -3,7 +3,8 @@
 // * More test cases
 // * Much better description strings
 
-import * as util from '../lo_event/util.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+import * as util from '../src/util.js';
 
 let someAsyncCondition;
 global.document = {};
@@ -23,7 +24,7 @@ async function checkCondition () {
   return someAsyncCondition;
 }
 
-xdescribe('Testing Backoff functionality', () => {
+describe.skip('Testing Backoff functionality', () => {
   beforeEach(() => {
     console.log('util.js:backoff Setting condition to false');
     someAsyncCondition = false;
@@ -103,4 +104,3 @@ describe('util.js testing', () => {
     expect(util.copyFields(source, fields)).toEqual({ foo: 'bar' });
   });
 });
-

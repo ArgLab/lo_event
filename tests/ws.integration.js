@@ -5,11 +5,11 @@
  */
 
 import { WebSocketServer } from 'ws';
-import * as debug from '../lo_event/debugLog.js';
-import { getBrowserInfo } from '../lo_event/metadata/browserinfo.js';
+import * as debug from '../src/debugLog.js';
+import { getBrowserInfo } from '../src/metadata/browserinfo.js';
 
-import * as loEvent from '../lo_event/lo_event.js';
-import * as websocketLogger from '../lo_event/websocketLogger.js';
+import * as loEvent from '../src/loEvent.js';
+import * as websocketLogger from '../src/websocketLogger.js';
 
 const DEBUG = false;
 

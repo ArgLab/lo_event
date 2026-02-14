@@ -11,12 +11,12 @@
 
 <div id="output"></div>
 <script type="module">
-  import { subscribeToEvents } from '../lo_event/browser_events.js';
-  import * as lo_event from '../lo_event/lo_event.js';
-  import { consoleLogger } from '../lo_event/consoleLogger.js';
-  import { browserInfo } from '../lo_event/metadata/browserinfo.js';
-  import { chromeAuth } from  '../lo_event/metadata/chromeauth.js';
-  import { localStorageInfo, sessionStorageInfo } from  '../lo_event/metadata/storage.js';
+  import { subscribeToEvents } from '../src/browserEvents.js';
+  import * as lo_event from '../src/loEvent.js';
+  import { consoleLogger } from '../src/consoleLogger.js';
+  import { browserInfo } from '../src/metadata/browserinfo.js';
+  import { chromeAuth } from  '../src/metadata/chromeauth.js';
+  import { localStorageInfo, sessionStorageInfo } from  '../src/metadata/storage.js';
 
   lo_event.init (
       "org.ets.browser-test",

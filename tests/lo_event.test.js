@@ -2,11 +2,12 @@
  * Test of basic functionality. This uses the redux logger, primarily.
  */
 
-import * as loEvent from '../lo_event/lo_event.js';
-import * as reduxLogger from '../lo_event/reduxLogger.js';
-import { consoleLogger } from '../lo_event/consoleLogger.js';
-import * as debug from '../lo_event/debugLog.js';
-import { getBrowserInfo } from '../lo_event/metadata/browserinfo.js';
+import { describe, it, expect } from 'vitest';
+import * as loEvent from '../src/loEvent.js';
+import * as reduxLogger from '../src/reduxLogger.js';
+import { consoleLogger } from '../src/consoleLogger.js';
+import * as debug from '../src/debugLog.js';
+import { getBrowserInfo } from '../src/metadata/browserinfo.js';
 
 const rl = reduxLogger.reduxLogger();
 

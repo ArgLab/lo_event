@@ -1,17 +1,26 @@
 {
-  "name": "lo_event",
+  "name": "lo-event",
   "version": "0.0.3",
   "description": "Event logging library for the Learning Observer",
-  "main": "lo_event/lo_event.js",
-  "scripts": {
-    "prebuild": "./lo_cli.js build",
-    "test": "jasmine \"tests/*.test.js\"",
-    "test-verbose": "jasmine --verbose \"tests/*.test.js\"",
-    "browser": "parcel examples/*.html --open",
-    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo_event-*.tgz"
+  "main": "src/loEvent.js",
+  "exports": {
+    ".": "./src/loEvent.js",
+    "./redux": "./src/reduxLogger.js",
+    "./debug": "./src/debugLog.js",
+    "./console": "./src/consoleLogger.js",
+    "./websocket": "./src/websocketLogger.js",
+    "./browser-events": "./src/browserEvents.js",
+    "./queue": "./src/queue.js",
+    "./storage": "./src/browserStorage.js",
+    "./disabler": "./src/disabler.js",
+    "./util": "./src/util.js",
+    "./null": "./src/nullLogger.js"
   },
-  "bin": {
-    "lo_cli": "lo_cli.js"
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "browser": "parcel examples/*.html --open",
+    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo-event-*.tgz"
   },
   "repository": {
     "type": "git",
@@ -30,8 +39,7 @@
     "lodash": "^4.17.21",
     "sqlite3": "^5.1.6",
     "uuid": "^10.0.0",
-    "ws": "^8.14.2",
-    "yargs": "^17.7.2"
+    "ws": "^8.14.2"
   },
   "peerDependencies": {
     "react": "^18.0.0",
@@ -48,31 +56,13 @@
     "redux-thunk": { "optional": true }
   },
   "devDependencies": {
-    "@babel/cli": "^7.24.5",
-    "@babel/core": "^7.24.5",
-    "@babel/preset-env": "^7.24.5",
-    "@babel/preset-react": "^7.24.7",
-    "assert": "^2.1.0",
-    "buffer": "^6.0.3",
-    "crypto-browserify": "^3.12.0",
-    "events": "^3.3.0",
-    "http-server": "^14.1.1",
-    "jasmine": "^5.1.0",
-    "mustache": "^4.2.0",
-    "os-browserify": "^0.3.0",
+    "vitest": "^3.0.0",
     "parcel": "^2.12.0",
-    "path-browserify": "^1.0.1",
-    "process": "^0.11.10",
-    "querystring-es3": "^0.2.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "redux": "^5.0.1",
     "redux-state-sync": "^3.1.4",
-    "redux-thunk": "^3.1.0",
-    "stream-browserify": "^3.0.0",
-    "url": "^0.11.3",
-    "util": "^0.12.5",
-    "vm-browserify": "^1.1.2"
+    "redux-thunk": "^3.1.0"
   },
   "browser": {
     "fs": false

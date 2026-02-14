@@ -1,29 +1,30 @@
 import { createRoot } from "react-dom/client";
-import * as lo_event from '../lo_event/lo_event';
-import * as reduxLogger from '../lo_event/reduxLogger.js';
-import { consoleLogger } from '../lo_event/consoleLogger.js';
-import * as debug from '../lo_event/debugLog.js';
-import { init } from '../lo_event/lo_assess/lo_assess.js';
-import { ActionButton, PopupAction, ConsoleAction } from '../lo_event/lo_assess/components/components.jsx';
+import * as lo_event from '../src/loEvent.js';
+import * as reduxLogger from '../src/reduxLogger.js';
+import { consoleLogger } from '../src/consoleLogger.js';
+import * as debug from '../src/debugLog.js';
 
-init();
+const rl = reduxLogger.reduxLogger();
 
+lo_event.init(
+  'org.ets.lo_event.redux_demo',
+  '0.0.1',
+  [consoleLogger(), rl],
+  {
+    debugLevel: debug.LEVEL.SIMPLE,
+    debugDest: [debug.LOG_OUTPUT.CONSOLE]
+  }
+);
 lo_event.go();
 
 export function App() {
   return (
     <>
       <h1>Hello world!!</h1>
-      <p> This demos how we can build actions with our API. Pressing the button will cause an alert and a console.log </p>
-      <ActionButton>
-        Test!
-        <PopupAction>
-          I am a little action, short and stout!
-        </PopupAction>
-        <ConsoleAction>
-          I am a bit of text!
-        </ConsoleAction>
-      </ActionButton>
+      <p>This demos the redux logger integration with lo_event.</p>
+      <button onClick={() => lo_event.logEvent('click', { target: 'demo_button' })}>
+        Log Event
+      </button>
     </>
   );
 }
