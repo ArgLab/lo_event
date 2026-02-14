@@ -68,8 +68,14 @@ export class Queue {
     debug.info('QUEUE: Dequeue loop initialized.');
 
     while (true) {
-      // Check if we are allowed to start dequeueing.
-      // exit dequeue loop if not allowed.
+      // Check if we are allowed to continue dequeueing.
+      // When shouldDequeue() returns false, we permanently terminate
+      // the loop. This is intentional — the primary caller is
+      // disabler.retry(), which only returns false for permanent
+      // opt-outs (e.g. student privacy requests). In that case,
+      // the loop must stop and must not restart. Temporary blocks
+      // (e.g. rate limits) are handled inside disabler.retry() by
+      // awaiting the expiration before returning true.
       try {
         if (!await shouldDequeue()) {
           throw new Error('QUEUE ERROR: Dequeue streaming returned false.');
