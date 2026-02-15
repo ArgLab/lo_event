@@ -1,4 +1,4 @@
-import { treeget, copyFields } from './util.js';
+import { copyFields } from './util.js';
 
 interface BrowserEventDescriptor {
   parent?: string[];

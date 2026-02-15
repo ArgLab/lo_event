@@ -154,7 +154,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
         util.dispatchCustomEvent('fetch_blob', { detail: response.data });
         break;
       default:
-        debug.info(`Received response we do not yet handle: ${response}`);
+        debug.info(`Received response we do not yet handle: ${JSON.stringify(response)}`);
         break;
     }
   }

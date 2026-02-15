@@ -69,7 +69,8 @@
     "build": "tsup",
     "prepublishOnly": "npm run build",
     "browser": "parcel examples/*.html --open",
-    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo-event-*.tgz",
+    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo_event-*.tgz",
+    "pack-install": "rm -f lo_event-*.tgz && npm run build && npm pack && npm install --no-save --prefix ../lo-blocks-test lo_event-*.tgz",
     "lint": "eslint src/ tests/"
   },
   "repository": {

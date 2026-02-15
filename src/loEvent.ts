@@ -211,10 +211,10 @@ export function logEvent (eventType: string, event: Record<string, unknown>) {
   if (!disabler.storeEvents()) {
     return;
   }
-  event.event = eventType;
-  timestampEvent(event);
+  const stamped = { ...event, event: eventType };
+  timestampEvent(stamped);
 
-  queue.enqueue(event);
+  queue.enqueue(stamped);
 }
 
 /**

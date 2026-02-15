@@ -216,7 +216,10 @@ const BASE_REDUCERS: Record<string, ReducerFn[]> = {
 
 const APPLICATION_REDUCERS: Record<string, ReducerFn[]> = {};
 
-export const registerReducer = (keys: string | string[], reducer: ReducerFn) => {
+export const registerReducer = <S = JSONObject, A = JSONObject>(
+  keys: string | string[],
+  reducer: (state: S, action: A) => S
+) => {
   const reducerKeys = Array.isArray(keys) ? keys : [keys];
 
   reducerKeys.forEach(key => {
@@ -224,7 +227,11 @@ export const registerReducer = (keys: string | string[], reducer: ReducerFn) => 
     if (!APPLICATION_REDUCERS[key]) {
       APPLICATION_REDUCERS[key] = [];
     }
-    APPLICATION_REDUCERS[key].push(reducer);
+    // lo_event calls application reducers with generic JSONObject state.
+    // The generic signature lets consumers keep their typed reducers;
+    // the cast here is the single boundary between typed app state and
+    // lo_event's internal representation.
+    APPLICATION_REDUCERS[key].push(reducer as unknown as ReducerFn);
   });
   return reducer;
 };
@@ -283,7 +290,7 @@ export let store: redux.Store<Record<string, unknown>> = redux.createStore(
 initMessageListener(store);
 
 let promise: (Promise<unknown> & { resolve?: (value: unknown) => void }) | null = null;
-let previousEvent: unknown = null;
+let previousEventString: string | null = null;
 let lockFields: Record<string, unknown> | null = null;
 let eventSubscribers: Array<(event: unknown) => void> = [];
 
@@ -341,11 +348,12 @@ function initializeStore () {
     }
     if (!state.event) return;
     debug_log('Received event:', state.event);
-    const event = JSON.parse(state.event as string);
-    if (event === previousEvent) {
+    const eventString = state.event as string;
+    if (eventString === previousEventString) {
       return;
     }
-    previousEvent = event;
+    previousEventString = eventString;
+    const event = JSON.parse(eventString);
 
     if (promise) {
       promise.resolve!(event);
@@ -395,7 +403,7 @@ export function reduxLogger (subscribers?: Array<(event: unknown) => void>, init
 // Note that this should not be used in threaded code or in multiple
 // places at the same time in async code. It's a convenience function
 // for _simple_ code.
-export const awaitEvent = (): unknown => {
+export const awaitEvent = (): unknown | Promise<unknown> => {
   if (eventQueue.length > 0) {
     return eventQueue.shift(); // Return the first event in the queue
   }

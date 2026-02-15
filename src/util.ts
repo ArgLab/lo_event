@@ -348,7 +348,7 @@ export function once<T extends (...args: any[]) => any>(func: T): T {
 export function treeget(tree: Record<string, unknown>, key: string): unknown {
   let keylist = key.split(".");
   let subtree: unknown = tree;
-  for(var i=0; i<keylist.length; i++) {
+  for(let i=0; i<keylist.length; i++) {
     // Don't process empty subtrees
     if (subtree === null) {
       return null;
@@ -397,14 +397,14 @@ export function treeget(tree: Record<string, unknown>, key: string): unknown {
  */
 export function formatTime(seconds: number): string {
   // Calculate hours, minutes, and remaining seconds
-  var hours = Math.floor(seconds / 3600);
-  var minutes = Math.floor((seconds % 3600) / 60);
-  var remainingSeconds = (seconds % 60).toFixed(2);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = (seconds % 60).toFixed(2);
 
   // Format hours, minutes, and remaining seconds to include leading zeros
-  var formattedHours = hours.toString().padStart(2, '0');
-  var formattedMinutes = minutes.toString().padStart(2, '0');
-  var formattedSeconds = remainingSeconds.padStart(5, '0');
+  const formattedHours = hours.toString().padStart(2, '0');
+  const formattedMinutes = minutes.toString().padStart(2, '0');
+  const formattedSeconds = remainingSeconds.padStart(5, '0');
 
   // Concatenate and return the formatted time
   if (hours > 0) {
