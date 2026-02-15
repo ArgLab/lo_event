@@ -24,7 +24,7 @@ import { createStateSyncMiddleware, initMessageListener } from 'redux-state-sync
 import debounce from 'lodash/debounce.js';
 
 import * as util from './util.js';
-import type { Logger } from './types.js';
+import type { Logger, ReducerFn, JSONObject, JSONValue } from './types.js';
 
 declare global {
   interface Window {
@@ -32,14 +32,11 @@ declare global {
   }
 }
 
-interface ReduxAction {
+interface ReduxAction extends JSONObject {
   redux_type: string;
   type: string;
-  payload: unknown;
+  payload: JSONValue;
 }
-
-type StoreState = Record<string, unknown>;
-type ReducerFn = (state: StoreState, action: ReduxAction) => StoreState;
 
 const EMIT_EVENT = 'EMIT_EVENT';
 const EMIT_LOCKFIELDS = 'EMIT_LOCKFIELDS';
@@ -63,14 +60,14 @@ function debug_log (...args: unknown[]) {
  */
 export function handleLoadState (data: unknown) {
   IS_LOADED = true;
-  const state = store.getState() as StoreState;
+  const state = store.getState() as JSONObject;
   if (data) {
     setState(
       {
         ...state,
         ...data,
         settings: {
-          ...(state.settings as Record<string, unknown>),
+          ...(state.settings as JSONObject),
           reduxStoreStatus: IS_LOADED
         }
       });
@@ -80,21 +77,21 @@ export function handleLoadState (data: unknown) {
       {
         ...state,
         settings: {
-          ...(state.settings as Record<string, unknown>),
+          ...(state.settings as JSONObject),
           reduxStoreStatus: IS_LOADED
         }
       });
   }
 }
 
-async function saveStateToLocalStorage (state: StoreState) {
+async function saveStateToLocalStorage (state: JSONObject) {
   if (!IS_LOADED) {
     debug_log('Not saving store locally because IS_LOADED is set to false.');
     return;
   }
 
   try {
-    const KEY = (state?.settings as Record<string, unknown>)?.reduxID as string || 'redux';
+    const KEY = (state?.settings as JSONObject)?.reduxID as string || 'redux';
     const serializedState = JSON.stringify(state);
     localStorage.setItem(KEY, serializedState);
   } catch (e) {
@@ -106,7 +103,7 @@ async function saveStateToLocalStorage (state: StoreState) {
  * Dispatch a `save_blob` event on the redux
  * logger.
  */
-async function saveStateToServer (state: StoreState) {
+async function saveStateToServer (state: JSONObject) {
   if (!IS_LOADED) {
     debug_log('Not saving store on the server because IS_LOADED is set to false.');
     return;
@@ -145,7 +142,7 @@ const emitSetField = (setField: string): ReduxAction => {
   };
 };
 
-const emitSetState = (state: StoreState): ReduxAction => {
+const emitSetState = (state: JSONObject): ReduxAction => {
   return {
     redux_type: EMIT_SET_STATE,
     type: EMIT_SET_STATE,
@@ -153,18 +150,20 @@ const emitSetState = (state: StoreState): ReduxAction => {
   };
 };
 
-function store_last_event_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
-  return { ...state, event: action.payload };
+function store_last_event_reducer (state: JSONObject = {}, action: JSONObject): JSONObject {
+  const a = action as ReduxAction;
+  return { ...state, event: a.payload };
 }
 
-function lock_fields_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
-  const payload = JSON.parse(action.payload as string);
+function lock_fields_reducer (state: JSONObject = {}, action: JSONObject): JSONObject {
+  const a = action as ReduxAction;
+  const payload = JSON.parse(a.payload as string);
   return {
     ...state,
     lock_fields: {
       ...payload,
       fields: {
-        ...((state.lock_fields as Record<string, unknown>)?.fields as Record<string, unknown> || {}),
+        ...((state.lock_fields as JSONObject)?.fields as JSONObject || {}),
         ...payload.fields
       }
     }
@@ -182,10 +181,10 @@ function lock_fields_reducer (state: StoreState = {}, action: ReduxAction): Stor
  *
  * Ergo, the two-level call with the destruct.
  */
-export const updateComponentStateReducer = ({}: Record<string, unknown>) => (state: StoreState = {}, action: Record<string, unknown>): StoreState => {
+export const updateComponentStateReducer = ({}: Record<string, unknown>): ReducerFn => (state: JSONObject = {}, action: JSONObject): JSONObject => {
   const { id, ...rest } = action;
-  const component_state = (state.component_state || {}) as Record<string, Record<string, unknown>>;
-  const new_state = {
+  const component_state = (state.component_state || {}) as { [key: string]: JSONObject };
+  const new_state: JSONObject = {
     ...state,
     component_state: {
       ...component_state,
@@ -205,8 +204,8 @@ export const updateComponentStateReducer = ({}: Record<string, unknown>) => (sta
   return new_state;
 }
 
-function set_state_reducer (state: StoreState = {}, action: ReduxAction): StoreState {
-  return action.payload as StoreState;
+function set_state_reducer (state: JSONObject = {}, action: JSONObject): JSONObject {
+  return (action as ReduxAction).payload as JSONObject;
 }
 
 const BASE_REDUCERS: Record<string, ReducerFn[]> = {
@@ -231,11 +230,13 @@ export const registerReducer = (keys: string | string[], reducer: ReducerFn) => 
 };
 
 // Reducer function
-const reducer = (state: StoreState = {}, action: ReduxAction): StoreState => {
+const reducer = (state: JSONObject = {}, action: ReduxAction): JSONObject => {
   let payload;
 
   debug_log('Reducing ', action, ' on ', state);
-  state = BASE_REDUCERS[action.redux_type] ? composeReducers(...BASE_REDUCERS[action.redux_type])(state, action) : state;
+  state = BASE_REDUCERS[action.redux_type]
+    ? composeReducers(...BASE_REDUCERS[action.redux_type])(state, action)
+    : state;
 
   if (action.redux_type === EMIT_EVENT) {
     payload = JSON.parse(action.payload as string);
@@ -243,7 +244,7 @@ const reducer = (state: StoreState = {}, action: ReduxAction): StoreState => {
       return {
         ...state,
         settings: {
-          ...(state.settings as Record<string, unknown>),
+          ...(state.settings as JSONObject),
           payload
         }
       };
@@ -251,7 +252,12 @@ const reducer = (state: StoreState = {}, action: ReduxAction): StoreState => {
     debug_log(Object.keys(payload));
 
     if (APPLICATION_REDUCERS[payload.event]) {
-      state = { ...state, application_state: composeReducers(...APPLICATION_REDUCERS[payload.event])((state.application_state || {}) as StoreState, payload) };
+      state = {
+        ...state,
+        application_state: composeReducers(...APPLICATION_REDUCERS[payload.event])(
+          (state.application_state || {}) as JSONObject, payload
+        )
+      };
     }
   }
 
@@ -270,7 +276,7 @@ const composeEnhancers = (typeof window !== 'undefined' && window.__REDUX_DEVTOO
 
 export let store: redux.Store<Record<string, unknown>> = redux.createStore(
   reducer as unknown as redux.Reducer<Record<string, unknown>>,
-  { event: null } as unknown as Record<string, unknown>, // Base state
+  { event: null } as unknown as JSONObject, // Base state
   composeEnhancers(redux.applyMiddleware(((thunk as any).default || thunk) as redux.Middleware, createStateSyncMiddleware() as redux.Middleware))
 );
 
@@ -300,13 +306,13 @@ function composeReducers(...reducers: ReducerFn[]): ReducerFn {
   );
 }
 
-export function setState(state: StoreState) {
+export function setState(state: JSONObject) {
   debug_log('Set state called');
   if (Object.keys(state).length === 0) {
-    const storeState = store.getState() as StoreState;
+    const storeState = store.getState() as JSONObject;
     state = {
       settings: {
-        ...(storeState.settings as Record<string, unknown>),
+        ...(storeState.settings as JSONObject),
         reduxStoreStatus: IS_LOADED
       }
     };
@@ -314,24 +320,24 @@ export function setState(state: StoreState) {
   store.dispatch(emitSetState(state) as unknown as redux.Action);
 }
 
-const debouncedSaveStateToLocalStorage = debounce((state: StoreState) => {
+const debouncedSaveStateToLocalStorage = debounce((state: JSONObject) => {
   saveStateToLocalStorage(state);
 }, 1000);
 
-const debouncedSaveStateToServer = debounce((state: StoreState) => {
+const debouncedSaveStateToServer = debounce((state: JSONObject) => {
   saveStateToServer(state);
 }, 1000);
 
 function initializeStore () {
   store.subscribe(() => {
-    const state = store.getState() as StoreState;
+    const state = store.getState() as JSONObject;
     // we use debounce to save the state once every second
     // for better performances in case multiple changes occur in a short time
     debouncedSaveStateToLocalStorage(state);
     debouncedSaveStateToServer(state);
 
     if (state.lock_fields) {
-      lockFields = (state.lock_fields as Record<string, unknown>).fields as Record<string, unknown>;
+      lockFields = (state.lock_fields as JSONObject).fields as JSONObject;
     }
     if (!state.event) return;
     debug_log('Received event:', state.event);
@@ -356,7 +362,7 @@ function initializeStore () {
   });
 }
 
-export function reduxLogger (subscribers?: Array<(event: unknown) => void>, initialState: StoreState | null = null): Logger {
+export function reduxLogger (subscribers?: Array<(event: unknown) => void>, initialState: JSONObject | null = null): Logger {
   if (subscribers != null) {
     eventSubscribers = subscribers;
   }

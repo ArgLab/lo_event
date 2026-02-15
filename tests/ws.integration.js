@@ -79,8 +79,10 @@ loEvent.init(
   'org.ets.lo_event.test',
   '1',
   [wsl],
-  debug.LEVEL.SIMPLE,
-  [debug.LOG_OUTPUT.LOGGER(loEvent.logEvent), debug.LOG_OUTPUT.CONSOLE]
+  {
+    debugLevel: debug.LEVEL.SIMPLE,
+    debugDest: [debug.LOG_OUTPUT.LOGGER(loEvent.logEvent), debug.LOG_OUTPUT.CONSOLE]
+  }
 );
 loEvent.lockFields([{ preauth_type: 'test' }]);
 loEvent.lockFields([{ postauth_type: 'test' }, getBrowserInfo()]);

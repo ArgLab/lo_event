@@ -122,7 +122,7 @@ export function init (
   version: string,
   loggers: Logger[],
   {
-    debugLevel = debug.LEVEL.NONE,
+    debugLevel = debug.LEVEL.NONE as string,
     debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
     queueType = Queue.QueueType.AUTODETECT as string,

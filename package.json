@@ -57,6 +57,10 @@
     "./null": {
       "types": "./dist/nullLogger.d.ts",
       "import": "./dist/nullLogger.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
     }
   },
   "scripts": {

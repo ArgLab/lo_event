@@ -246,12 +246,17 @@ function copyTargets(event: Event): Record<string, Record<string, unknown>> {
   const compiledTargets: Record<string, Record<string, unknown>> = {};   // The information we return
   const uncompiledTargets: Record<string, EventTarget> = {}; // The actual target object themselves
 
+  // These properties live on different Event subtypes (UIEvent.view,
+  // MouseEvent.relatedTarget, etc.). We probe dynamically rather than
+  // narrowing to each subtype.
+  const eventRecord = event as unknown as Record<string, unknown>;
+
   // For each candidate target which exists....
   targets.forEach((targetKey) => {
-    if ((event as unknown as Record<string, unknown>)[targetKey]) {
+    if (eventRecord[targetKey]) {
       // Check if we've already processed it
       let duplicateKeys = Object.keys(uncompiledTargets).filter(key => {
-        return uncompiledTargets[key] === (event as unknown as Record<string, unknown>)[targetKey];
+        return uncompiledTargets[key] === eventRecord[targetKey];
       });
       // If so, we just add it to our list of duplicates
       if (duplicateKeys.length > 0) {
@@ -261,8 +266,8 @@ function copyTargets(event: Event): Record<string, Record<string, unknown>> {
         (compiledTargets[duplicateKeys[0]].dupes as string[]).push(targetKey);
       // Otherwise, we include it in the main dictionary.
       } else {
-        uncompiledTargets[targetKey] = (event as unknown as Record<string, unknown>)[targetKey] as EventTarget;
-        compiledTargets[targetKey] = targetInfo((event as unknown as Record<string, unknown>)[targetKey] as EventTarget);
+        uncompiledTargets[targetKey] = eventRecord[targetKey] as EventTarget;
+        compiledTargets[targetKey] = targetInfo(eventRecord[targetKey] as EventTarget);
       }
     }
   });

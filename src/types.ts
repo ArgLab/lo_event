@@ -6,6 +6,30 @@
  */
 
 /**
+ * Recursive type for JSON-serializable values.
+ */
+export type JSONValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JSONValue[]
+  | { [key: string]: JSONValue };
+
+/**
+ * A JSON object — the subset of JSONValue that's always an object.
+ * Redux state and actions are always objects, never bare primitives.
+ */
+export type JSONObject = { [key: string]: JSONValue };
+
+/**
+ * Redux reducer function. Takes a JSON object (state) and a JSON
+ * object (action), returns a JSON object. Application reducers
+ * narrow internally to their specific state shapes.
+ */
+export type ReducerFn = (state: JSONObject, action: JSONObject) => JSONObject;
+
+/**
  * A Logger is a callable that receives JSON-encoded event strings.
  * It may optionally have init(), setField(), and metadata properties.
  */
