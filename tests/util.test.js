@@ -3,7 +3,8 @@
 // * More test cases
 // * Much better description strings
 
-import * as util from '../lo_event/util.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+import * as util from '../src/util.js';
 
 let someAsyncCondition;
 global.document = {};
@@ -17,23 +18,17 @@ function debug_log(...args) {
 }
 
 async function checkCondition () {
-  // Example of a condition check
-  // Replace this with your actual condition check logic
   debug_log('Util test: checking', someAsyncCondition);
   return someAsyncCondition;
 }
 
-xdescribe('Testing Backoff functionality', () => {
+describe.skip('Testing Backoff functionality', () => {
   beforeEach(() => {
-    console.log('util.js:backoff Setting condition to false');
     someAsyncCondition = false;
   });
 
   it('Check for generic backoff functionality', async () => {
-    console.log('TESTING THIS FUNCTION');
-    // Set the condition to true after some time for demonstration
     setTimeout(() => {
-      console.log('Util test: setting someAsyncCondition');
       someAsyncCondition = true;
     }, 1000);
 
@@ -62,7 +57,6 @@ xdescribe('Testing Backoff functionality', () => {
 });
 
 describe('util.js testing', () => {
-  console.log("Testing rest of util.js");
   it('Test fullyQualifiedWebsocketURL', () => {
     // We need a function wrapper to check for thrown errors
     expect(function () {
@@ -87,7 +81,6 @@ describe('util.js testing', () => {
   });
 
   it('it should copy specified fields from the source object', () => {
-    console.log("Testing copy fields");
     const source = { foo: 'bar', baz: 'qux' };
     const fields = ['foo', 'baz'];
     expect(util.copyFields(source, fields)).toEqual({ foo: 'bar', baz: 'qux' });
@@ -103,4 +96,3 @@ describe('util.js testing', () => {
     expect(util.copyFields(source, fields)).toEqual({ foo: 'bar' });
   });
 });
-

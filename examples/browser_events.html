@@ -1,48 +1,70 @@
 <!DOCTYPE html>
 <html>
 <body>
-<h1>HTML DOM Events</h1>
+<h1>Browser Events Demo</h1>
 
-<p>Demo page for HTML events.</p>
+<p>
+  This page captures DOM events (keystrokes, mouse clicks, clipboard
+  operations, etc.) and displays them below. Events also go to the
+  browser console via <code>consoleLogger</code>.
+</p>
+
+<p>
+  <strong>How it works:</strong>
+  <code>subscribeToEvents</code> attaches listeners for ~60 event types
+  to the document. Each event is normalized into a consistent format
+  with parent-class properties (e.g. mouse events include coordinates,
+  key events include modifiers). The <code>dispatch</code> callback
+  receives the event type and extracted properties.
+</p>
+
+<p>Try typing, clicking, copying, pasting, or switching tabs:</p>
 
 <input id="myInput" type="text" value="Copy/paste test">
 
-<p id="demo"></p>
+<div id="output" style="max-height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; margin-top: 8px; font-family: monospace; font-size: 12px;"></div>
 
-<div id="output"></div>
 <script type="module">
-  import { subscribeToEvents } from '../lo_event/browser_events.js';
-  import * as lo_event from '../lo_event/lo_event.js';
-  import { consoleLogger } from '../lo_event/consoleLogger.js';
-  import { browserInfo } from '../lo_event/metadata/browserinfo.js';
-  import { chromeAuth } from  '../lo_event/metadata/chromeauth.js';
-  import { localStorageInfo, sessionStorageInfo } from  '../lo_event/metadata/storage.js';
+  // subscribeToEvents: attaches DOM event listeners and normalizes properties
+  import { subscribeToEvents } from '../src/browserEvents.ts';
+  // Core lo-event: init → lockFields → go → logEvent
+  import * as lo_event from '../src/loEvent.ts';
+  // consoleLogger: simplest logger, just prints to console.log
+  import { consoleLogger } from '../src/consoleLogger.ts';
+  // Metadata collectors: each returns { name, func } for compileMetadata
+  import { browserInfo } from '../src/metadata/browserinfo.ts';
+  import { chromeAuth } from  '../src/metadata/chromeauth.ts';
+  import { localStorageInfo, sessionStorageInfo } from  '../src/metadata/storage.ts';
 
-  lo_event.init (
+  // Initialize lo-event with metadata tasks.
+  // Metadata tasks run once at startup; their results are sent as
+  // lock_fields so the server knows browser capabilities, auth, etc.
+  lo_event.init(
       "org.ets.browser-test",
       "0.0.1",
       [consoleLogger()],
       {
           metadata: [
-              browserInfo(),
-              chromeAuth(),
-              localStorageInfo(),
-              sessionStorageInfo()
+              browserInfo(),        // navigator, screen, connection info
+              chromeAuth(),         // Chrome extension identity (if available)
+              localStorageInfo(),   // snapshot of localStorage
+              sessionStorageInfo()  // snapshot of sessionStorage
           ]
       }
   );
   lo_event.go();
 
+  // Display events on the page (in addition to console logging)
   function logToDiv(eventType, event) {
-      // Select the output div
       var outputDiv = document.getElementById("output");
-
-      // Append the text to the div
       outputDiv.innerHTML += `<b>${eventType}</b>: ${JSON.stringify(event)}<br/>`;
-
-      console.log(`${eventType}: ${JSON.stringify(event)}`);
+      // Auto-scroll to bottom
+      outputDiv.scrollTop = outputDiv.scrollHeight;
   }
 
+  // Subscribe to all browser events, routing them to our display function.
+  // In a real application, you'd use lo_event.logEvent as the dispatch:
+  //   subscribeToEvents({ dispatch: (type, props) => lo_event.logEvent(type, props) });
   subscribeToEvents({dispatch: logToDiv});
 </script>
 

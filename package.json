@@ -1,65 +1,112 @@
 {
   "name": "lo_event",
-  "version": "0.0.3",
+  "version": "0.0.4-alpha.1",
   "description": "Event logging library for the Learning Observer",
-  "main": "lo_event/lo_event.js",
-  "scripts": {
-    "prebuild": "./lo_cli.js build",
-    "test": "jasmine \"tests/*.test.js\"",
-    "test-verbose": "jasmine --verbose \"tests/*.test.js\"",
-    "browser": "parcel examples/*.html --open",
-    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo_event-*.tgz"
+  "main": "dist/loEvent.js",
+  "types": "dist/loEvent.d.ts",
+  "targets": {
+    "main": false,
+    "types": false
   },
-  "bin": {
-    "lo_cli": "lo_cli.js"
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE.TXT"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/loEvent.d.ts",
+      "import": "./dist/loEvent.js"
+    },
+    "./redux": {
+      "types": "./dist/reduxLogger.d.ts",
+      "import": "./dist/reduxLogger.js"
+    },
+    "./debug": {
+      "types": "./dist/debugLog.d.ts",
+      "import": "./dist/debugLog.js"
+    },
+    "./console": {
+      "types": "./dist/consoleLogger.d.ts",
+      "import": "./dist/consoleLogger.js"
+    },
+    "./websocket": {
+      "types": "./dist/websocketLogger.d.ts",
+      "import": "./dist/websocketLogger.js"
+    },
+    "./browser-events": {
+      "types": "./dist/browserEvents.d.ts",
+      "import": "./dist/browserEvents.js"
+    },
+    "./queue": {
+      "types": "./dist/queue.d.ts",
+      "import": "./dist/queue.js"
+    },
+    "./storage": {
+      "types": "./dist/browserStorage.d.ts",
+      "import": "./dist/browserStorage.js"
+    },
+    "./disabler": {
+      "types": "./dist/disabler.d.ts",
+      "import": "./dist/disabler.js"
+    },
+    "./util": {
+      "types": "./dist/util.d.ts",
+      "import": "./dist/util.js"
+    },
+    "./null": {
+      "types": "./dist/nullLogger.d.ts",
+      "import": "./dist/nullLogger.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "browser": "parcel examples/*.html --open",
+    "clean": "rm -Rf .cache/ dist/ .parcel-cache/ lo_event-*.tgz",
+    "pack-install": "rm -f lo_event-*.tgz && npm run build && npm pack && npm install --no-save --prefix ../lo-blocks-test lo_event-*.tgz",
+    "lint": "eslint src/ tests/"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ETS-Next-Gen/writing_observer.git"
+    "url": "git+https://github.com/ArgLab/lo_event.git"
   },
   "author": "Piotr Mitros",
-  "license": "SEE LICENSE IN license.txt",
+  "license": "SEE LICENSE IN LICENSE.TXT",
   "bugs": {
-    "url": "https://github.com/ETS-Next-Gen/writing_observer/issues"
+    "url": "https://github.com/ArgLab/lo_event/issues"
   },
-  "homepage": "https://github.com/ETS-Next-Gen/writing_observer#readme",
+  "homepage": "https://github.com/ArgLab/lo_event#readme",
   "type": "module",
   "dependencies": {
-    "aws-sdk": "^2.1614.0",
-    "debounce": "^2.2.0",
-    "http-server": "^14.1.1",
-    "indexeddb-js": "^0.0.14",
-    "jasmine": "^5.1.0",
     "lodash": "^4.17.21",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "redux": "^5.0.1",
     "redux-state-sync": "^3.1.4",
     "redux-thunk": "^3.1.0",
-    "sqlite3": "^5.1.6",
     "uuid": "^10.0.0",
-    "ws": "^8.14.2",
-    "yargs": "^17.7.2"
+    "ws": "^8.14.2"
   },
   "devDependencies": {
-    "@babel/cli": "^7.24.5",
-    "@babel/core": "^7.24.5",
-    "@babel/preset-env": "^7.24.5",
-    "@babel/preset-react": "^7.24.7",
-    "assert": "^2.1.0",
-    "buffer": "^6.0.3",
-    "crypto-browserify": "^3.12.0",
-    "events": "^3.3.0",
-    "mustache": "^4.2.0",
-    "os-browserify": "^0.3.0",
+    "@types/lodash": "^4.17.23",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/parser": "^8.55.0",
+    "eslint": "^9.39.2",
+    "globals": "^17.3.0",
     "parcel": "^2.12.0",
-    "path-browserify": "^1.0.1",
-    "process": "^0.11.10",
-    "querystring-es3": "^0.2.1",
-    "stream-browserify": "^3.0.0",
-    "url": "^0.11.3",
-    "util": "^0.12.5",
-    "vm-browserify": "^1.1.2"
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.0"
   },
   "browser": {
     "fs": false
