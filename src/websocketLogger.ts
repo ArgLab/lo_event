@@ -138,10 +138,21 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
           response.action
         );
         break;
-      case 'auth':
-        storage.set({ user_id: response.user_id });
-        util.dispatchCustomEvent('auth', { detail: { user_id: response.user_id } });
+      case 'auth': {
+        // Server pushes identity after it resolves the WS auth (HTTP Basic via
+        // nginx, LTI session, guest cookie, etc.). We stash it in the storage
+        // shim (for non-Redux consumers) and dispatch a DOM CustomEvent so
+        // reduxLogger (and anything else that listens) can react.
+        //
+        // Forward-compat: we spread every field except `status` into the user
+        // object so new profile fields (avatar, role, safe_user_id, ...) added
+        // server-side flow through without touching this file. Consumers
+        // should treat `user_id` as the only required field.
+        const { status, ...user } = response;
+        storage.set(user);
+        util.dispatchCustomEvent('auth', { detail: user });
         break;
+      }
       // These should probably be behind a feature flag, as they assume
       // we trust the server.
       case 'local_storage':
