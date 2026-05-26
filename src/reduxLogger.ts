@@ -422,5 +422,30 @@ export const awaitEvent = (): unknown | Promise<unknown> => {
   return promise;
 };
 
+/**
+ * Consume an `auth` DOM CustomEvent (dispatched by websocketLogger when the
+ * server echoes `{status:'auth', ...}`) and land the resolved user identity
+ * in Redux as `state.application_state.system.currentUser`.
+ *
+ * We dispatch an `EMIT_EVENT` with event type `SET_CURRENT_USER`, scope
+ * `system`, and the full user object. Applications that register a field
+ * for `currentUser` will pick this up via their normal field-reducer wiring.
+ * Applications that don't register a matching reducer will simply no-op,
+ * which is the correct default.
+ *
+ * No IS_LOADED gating: auth arrives on every connection, even before the
+ * first fetch_blob round-trip, and we want currentUser available as soon as
+ * it's known so downstream code (e.g., fetch_blob gating) can proceed.
+ */
+export function handleAuth (user: unknown) {
+  if (!user || typeof user !== 'object' || !('user_id' in user) || !user.user_id) return;
+  store.dispatch(emitEvent(JSON.stringify({
+    event: 'SET_CURRENT_USER',
+    currentUser: user,
+    scope: 'system'
+  })) as unknown as redux.Action);
+}
+
 // Start listening for fetch
 util.consumeCustomEvent('fetch_blob', handleLoadState);
+util.consumeCustomEvent('auth', handleAuth);
