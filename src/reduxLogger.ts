@@ -32,17 +32,74 @@ declare global {
   }
 }
 
+// =============================================================================
+// Types
+// =============================================================================
+
 interface ReduxAction extends JSONObject {
   redux_type: string;
   type: string;
   payload: JSONValue;
 }
 
+export type SaveStatus = 'saved' | 'modified' | 'error';
+
+/**
+ * Options for the Redux logger's persistence behavior.
+ *
+ * serializeForSave:  Called before every save (server and localStorage).
+ *                    Receives the full Redux state, returns the subset to persist.
+ *                    Default: identity (persist everything).
+ *
+ * deserializeOnLoad: Called when a fetch_blob response arrives.
+ *                    Receives the raw blob from the server and the current Redux state.
+ *                    Returns the blob to merge (via shallow spread) into current state.
+ *                    Default: identity (merge entire blob).
+ */
+export interface ReduxLoggerOptions {
+  serializeForSave?: (state: JSONObject) => JSONObject;
+  deserializeOnLoad?: (blob: JSONObject, currentState: JSONObject) => JSONObject;
+  /**
+   * Cross-tab state sync via redux-state-sync. Default: false.
+   *
+   * When true, every dispatched action is broadcast over a BroadcastChannel
+   * to other store instances in the same browser (other tabs, and — in dev —
+   * HMR-duplicated module instances). This is off by default because reactive
+   * effects can echo actions between stores in an unbounded feedback loop;
+   * enable it only with a suitable action blacklist and a single-store
+   * guarantee.
+   */
+  stateSync?: boolean;
+}
+
+// =============================================================================
+// Module state
+// =============================================================================
+
 const EMIT_EVENT = 'EMIT_EVENT';
 const EMIT_LOCKFIELDS = 'EMIT_LOCKFIELDS';
 const EMIT_SET_STATE = 'SET_STATE';
 
 let IS_LOADED = false;
+let _options: ReduxLoggerOptions = {};
+
+// Cross-tab state sync gating (see ReduxLoggerOptions.stateSync).
+// The middleware's predicate reads _stateSyncEnabled at dispatch time, so
+// toggling this after the store is created takes effect immediately. The
+// incoming-message listener is attached lazily and only when enabled, so a
+// disabled store neither sends nor receives. Default off (opt-in).
+let _stateSyncEnabled = false;
+let _stateSyncListenerAttached = false;
+
+function ensureStateSyncListener () {
+  // Browser-only: initMessageListener uses the BroadcastChannel, which is
+  // not available (and not meaningful) server-side.
+  if (typeof window === 'undefined' || typeof BroadcastChannel === 'undefined') return;
+  if (_stateSyncEnabled && !_stateSyncListenerAttached) {
+    initMessageListener(store);
+    _stateSyncListenerAttached = true;
+  }
+}
 
 // TODO: Import debugLog and use those functions.
 const DEBUG = false;
@@ -53,35 +110,102 @@ function debug_log (...args: unknown[]) {
   }
 }
 
+// =============================================================================
+// Persistence status — plain external store (NOT in Redux)
+//
+// These are metadata about the save machinery, not application state.
+// Keeping them outside Redux avoids cross-tab dispatch loops via
+// redux-state-sync and keeps the store subscription read-only.
+//
+// React consumers use useSyncExternalStore via the hooks in hooks.ts.
+// =============================================================================
+
+let _saveStatus: SaveStatus = 'saved';
+let _connected: boolean | null = null;  // null = no websocket configured
+
+// Monotonic token: incremented on each save_blob dispatch, compared against
+// the token echoed back in save_blob_ack. Status is 'saved' only when the
+// server has confirmed the most recent save.
+let _saveToken = 0;
+let _ackedToken = 0;
+
+const _statusListeners = new Set<() => void>();
+
+function notifyStatusListeners () {
+  _statusListeners.forEach(fn => fn());
+}
+
+function markModified () {
+  if (_saveStatus !== 'modified') {
+    _saveStatus = 'modified';
+    notifyStatusListeners();
+  }
+}
+
+function markSaved () {
+  if (_saveStatus !== 'saved') {
+    _saveStatus = 'saved';
+    notifyStatusListeners();
+  }
+}
+
+// The server reported a save failure. Distinct from 'modified' so the UI can
+// tell "still saving" from "save failed". A subsequent change re-enters
+// 'modified' (markModified), and the next successful ack clears it to 'saved'.
+function markError () {
+  if (_saveStatus !== 'error') {
+    _saveStatus = 'error';
+    notifyStatusListeners();
+  }
+}
+
+function setConnected (value: boolean) {
+  if (_connected !== value) {
+    _connected = value;
+    notifyStatusListeners();
+  }
+}
+
+/** Subscribe to persistence status changes (save status, connected, loaded). */
+export function subscribeStatus (listener: () => void): () => void {
+  _statusListeners.add(listener);
+  return () => { _statusListeners.delete(listener); };
+}
+
+/** Snapshot of save status for useSyncExternalStore. */
+export function getSaveStatus (): SaveStatus { return _saveStatus; }
+
+/** Snapshot of connection status. null = no websocket, true/false = connected/disconnected. */
+export function getConnected (): boolean | null { return _connected; }
+
+/** Snapshot of loaded status (fetch_blob resolved or no persistence). */
+export function getLoaded (): boolean { return IS_LOADED; }
+
+// =============================================================================
+// Load / Save
+// =============================================================================
+
 /**
  * Update the redux logger's state with `data`.
- * This is fired when consuming a custom `fetch_blob`
- * event.
+ * This is fired when consuming a custom `fetch_blob` event.
  */
 export function handleLoadState (data: unknown) {
   IS_LOADED = true;
   const state = store.getState() as JSONObject;
   if (data) {
-    setState(
-      {
-        ...state,
-        ...data,
-        settings: {
-          ...(state.settings as JSONObject),
-          reduxStoreStatus: IS_LOADED
-        }
-      });
+    const blob = _options.deserializeOnLoad
+      ? _options.deserializeOnLoad(data as JSONObject, state)
+      : data as JSONObject;
+    setState({ ...state, ...blob });
   } else {
     debug_log('No data provided while handling state from server, continuing.');
-    setState(
-      {
-        ...state,
-        settings: {
-          ...(state.settings as JSONObject),
-          reduxStoreStatus: IS_LOADED
-        }
-      });
   }
+  // After loading, state matches the server — reset tokens and mark saved.
+  // markSaved() AFTER setState so the subscription's markModified() fires
+  // first (synchronously from the dispatch), then we correct it here.
+  _ackedToken = _saveToken;
+  markSaved();
+  notifyStatusListeners();  // loaded changed
 }
 
 async function saveStateToLocalStorage (state: JSONObject) {
@@ -92,7 +216,8 @@ async function saveStateToLocalStorage (state: JSONObject) {
 
   try {
     const KEY = (state?.settings as JSONObject)?.reduxID as string || 'redux';
-    const serializedState = JSON.stringify(state);
+    const toSave = _options.serializeForSave ? _options.serializeForSave(state) : state;
+    const serializedState = JSON.stringify(toSave);
     localStorage.setItem(KEY, serializedState);
   } catch (e) {
     // Ignore
@@ -100,8 +225,7 @@ async function saveStateToLocalStorage (state: JSONObject) {
 }
 
 /**
- * Dispatch a `save_blob` event on the redux
- * logger.
+ * Dispatch a `save_blob` event on the redux logger.
  */
 async function saveStateToServer (state: JSONObject) {
   if (!IS_LOADED) {
@@ -110,14 +234,27 @@ async function saveStateToServer (state: JSONObject) {
   }
 
   try {
-    // console.log("dispatching save_blob")
-    util.dispatchCustomEvent('save_blob', { detail: state });
-    // store.dispatch('save_blob', { detail: state });
+    const toSave = _options.serializeForSave ? _options.serializeForSave(state) : state;
+    _saveToken++;
+    util.dispatchCustomEvent('save_blob', { detail: { blob: toSave, token: _saveToken } });
+    // Don't markSaved() here — wait for save_blob_ack from the server.
   } catch (e) {
-    // Ignore
     debug_log('Error in dispatch', { e });
   }
 }
+
+/**
+ * Immediately flush any pending debounced saves.
+ * Available for programmatic use (e.g. beforeunload handlers).
+ */
+export function saveNow () {
+  debouncedSaveStateToLocalStorage.flush();
+  debouncedSaveStateToServer.flush();
+}
+
+// =============================================================================
+// Action creators
+// =============================================================================
 
 // Action creator function This is a little bit messy, since we
 // duplicate type from the payload. It's not clear if this is a good
@@ -149,6 +286,10 @@ const emitSetState = (state: JSONObject): ReduxAction => {
     payload: state
   };
 };
+
+// =============================================================================
+// Reducers
+// =============================================================================
 
 function store_last_event_reducer (state: JSONObject = {}, action: JSONObject): JSONObject {
   const a = action as ReduxAction;
@@ -271,6 +412,10 @@ const reducer = (state: JSONObject = {}, action: ReduxAction): JSONObject => {
   return state;
 };
 
+// =============================================================================
+// Store
+// =============================================================================
+
 const eventQueue: unknown[] = [];
 const composeEnhancers = (typeof window !== 'undefined' && window.__REDUX_DEVTOOLS_EXTENSION_COMPOSE__) || redux.compose;
 
@@ -281,13 +426,31 @@ const composeEnhancers = (typeof window !== 'undefined' && window.__REDUX_DEVTOO
 // back to thunk.
 // const presistedState = loadState();
 
+// Cross-tab sync is a browser concept and createStateSyncMiddleware()
+// constructs a BroadcastChannel eagerly. In Node (server-side, SSR) that
+// hits broadcast-channel's filesystem fallback and throws, so we only add
+// the middleware in a browser. Note: a config object MUST include `channel`
+// — redux-state-sync replaces its whole defaultConfig with the passed config,
+// so omitting it yields `new BroadcastChannel(undefined)` and crashes.
+const _baseMiddleware: redux.Middleware[] = [((thunk as any).default || thunk) as redux.Middleware];
+if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+  // predicate gates outgoing broadcasts; the incoming listener is attached
+  // separately in ensureStateSyncListener(). Both respect _stateSyncEnabled.
+  _baseMiddleware.push(createStateSyncMiddleware({
+    channel: 'redux_state_sync',
+    predicate: () => _stateSyncEnabled,
+  }) as redux.Middleware);
+}
+
 export let store: redux.Store<Record<string, unknown>> = redux.createStore(
   reducer as unknown as redux.Reducer<Record<string, unknown>>,
   { event: null } as unknown as JSONObject, // Base state
-  composeEnhancers(redux.applyMiddleware(((thunk as any).default || thunk) as redux.Middleware, createStateSyncMiddleware() as redux.Middleware))
+  composeEnhancers(redux.applyMiddleware(..._baseMiddleware))
 );
 
-initMessageListener(store);
+// initMessageListener is attached lazily by reduxLogger() when stateSync is
+// enabled — see ensureStateSyncListener(). Attaching it unconditionally here
+// would make a disabled store still receive (and respond to) broadcasts.
 
 let promise: (Promise<unknown> & { resolve?: (value: unknown) => void }) | null = null;
 let previousEventString: string | null = null;
@@ -316,13 +479,8 @@ function composeReducers(...reducers: ReducerFn[]): ReducerFn {
 export function setState(state: JSONObject) {
   debug_log('Set state called');
   if (Object.keys(state).length === 0) {
-    const storeState = store.getState() as JSONObject;
-    state = {
-      settings: {
-        ...(storeState.settings as JSONObject),
-        reduxStoreStatus: IS_LOADED
-      }
-    };
+    debug_log('setState called with empty object — ignoring');
+    return;
   }
   store.dispatch(emitSetState(state) as unknown as redux.Action);
 }
@@ -335,11 +493,18 @@ const debouncedSaveStateToServer = debounce((state: JSONObject) => {
   saveStateToServer(state);
 }, 1000);
 
+// =============================================================================
+// Store initialization & subscription
+// =============================================================================
+
 function initializeStore () {
+  // The subscription is read-only — it never dispatches to the store.
+  // Save status lives in a plain module-level variable (see above),
+  // avoiding cross-tab loops via redux-state-sync.
   store.subscribe(() => {
     const state = store.getState() as JSONObject;
-    // we use debounce to save the state once every second
-    // for better performances in case multiple changes occur in a short time
+
+    markModified();
     debouncedSaveStateToLocalStorage(state);
     debouncedSaveStateToServer(state);
 
@@ -364,16 +529,37 @@ function initializeStore () {
       // to have this behind a flag later.
       eventQueue.push(event);
     }
-    for (const i in eventSubscribers) {
-      eventSubscribers[i](event);
+    for (const subscriber of eventSubscribers) {
+      subscriber(event);
     }
   });
+
+  // Flush any pending saves when the page is about to close.
+  // The IndexedDB-backed queue in websocketLogger survives page close,
+  // so even if the browser terminates before the WebSocket send completes,
+  // the blob is persisted locally and transmitted on the next page load.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', () => {
+      saveNow();
+    });
+  }
 }
 
-export function reduxLogger (subscribers?: Array<(event: unknown) => void>, initialState: JSONObject | null = null): Logger {
+// =============================================================================
+// Logger factory
+// =============================================================================
+
+export function reduxLogger (subscribers?: Array<(event: unknown) => void>, options: ReduxLoggerOptions = {}): Logger {
   if (subscribers != null) {
     eventSubscribers = subscribers;
   }
+  _options = options;
+
+  // Opt-in (default false). When enabled, attach the incoming listener (once);
+  // when disabled, the predicate above stops all outgoing broadcasts and we
+  // never attach the listener, so nothing is received.
+  _stateSyncEnabled = options.stateSync === true;
+  ensureStateSyncListener();
 
   const logEvent: Logger = function (event: string) {
     store.dispatch(emitEvent(event) as unknown as redux.Action);
@@ -390,10 +576,6 @@ export function reduxLogger (subscribers?: Array<(event: unknown) => void>, init
   };
 
   logEvent.getLockFields = function () { return lockFields; };
-
-  // do we want to initialize the store here? We set it to the stored state in create store
-  // if (initialState) {
-  // }
 
   return logEvent;
 }
@@ -446,6 +628,35 @@ export function handleAuth (user: unknown) {
   })) as unknown as redux.Action);
 }
 
-// Start listening for fetch
+// =============================================================================
+// CustomEvent listeners
+// =============================================================================
+
 util.consumeCustomEvent('fetch_blob', handleLoadState);
 util.consumeCustomEvent('auth', handleAuth);
+
+// Connection status from websocketLogger
+util.consumeCustomEvent('lo_connection_status', (data: unknown) => {
+  const { connected } = data as { connected: boolean };
+  setConnected(connected);
+});
+
+// Server acknowledgment of a save_blob write.
+// Only mark saved if this ack is for the most recent save — stale acks
+// (from earlier saves) are ignored because a newer save is still pending.
+util.consumeCustomEvent('save_blob_ack', (data: unknown) => {
+  const { token } = data as { token: number };
+  if (token > _ackedToken) {
+    _ackedToken = token;
+  }
+  if (_ackedToken >= _saveToken) {
+    markSaved();
+  }
+});
+
+// Server reported a save_blob write failure. Don't advance _ackedToken — the
+// blob did not persist — and surface the failure so the UI isn't stuck looking
+// like a save is merely in progress.
+util.consumeCustomEvent('save_blob_nack', () => {
+  markError();
+});

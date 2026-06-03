@@ -16,6 +16,7 @@ export default defineConfig({
     memoryQueue: 'src/memoryQueue.ts',
     indexeddbQueue: 'src/indexeddbQueue.ts',
     types: 'src/types.ts',
+    hooks: 'src/hooks.ts',
     'metadata/browserinfo': 'src/metadata/browserinfo.ts',
     'metadata/chromeauth': 'src/metadata/chromeauth.ts',
     'metadata/storage': 'src/metadata/storage.ts',
@@ -24,7 +25,14 @@ export default defineConfig({
   dts: true,
   sourcemap: true,
   clean: true,
-  splitting: false,
+  // splitting MUST stay true: several entry points (e.g. hooks.ts) re-export
+  // stateful module-level singletons from reduxLogger.ts (save status, the
+  // status-listener set, the redux store). With splitting:false, tsup inlines
+  // a SEPARATE copy of reduxLogger into each entry, so e.g. useSaved() in
+  // hooks.js reads a different _saveStatus than the store subscription in
+  // reduxLogger.js updates — the indicator gets stuck. Sharing a chunk keeps
+  // those singletons singular across entry points.
+  splitting: true,
   target: 'es2022',
-  external: ['ws', 'redux', 'redux-thunk', 'redux-state-sync', 'lodash'],
+  external: ['ws', 'redux', 'redux-thunk', 'redux-state-sync', 'lodash', 'react'],
 });

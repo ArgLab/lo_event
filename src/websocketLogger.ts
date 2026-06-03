@@ -81,8 +81,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
       } else {
         READY = true;
         failures = 0;
+        util.dispatchCustomEvent('lo_connection_status', { detail: { connected: true } });
         await socketClosed();
         READY = false;
+        util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
       }
     }
   }
@@ -164,6 +166,12 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
       case 'fetch_blob':
         util.dispatchCustomEvent('fetch_blob', { detail: response.data });
         break;
+      case 'save_blob_ack':
+        util.dispatchCustomEvent('save_blob_ack', { detail: { token: response.token } });
+        break;
+      case 'save_blob_nack':
+        util.dispatchCustomEvent('save_blob_nack', { detail: { token: response.token } });
+        break;
       default:
         debug.info(`Received response we do not yet handle: ${JSON.stringify(response)}`);
         break;
@@ -218,8 +226,9 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
     queue.enqueue(data);
   };
 
-  function handleSaveBlob (blob: unknown) {
-    queue.enqueue(JSON.stringify({ event: 'save_blob', blob }));
+  function handleSaveBlob (data: unknown) {
+    const { blob, token } = data as { blob: unknown; token: number };
+    queue.enqueue(JSON.stringify({ event: 'save_blob', blob, token }));
   }
 
   util.consumeCustomEvent('save_blob', handleSaveBlob);
