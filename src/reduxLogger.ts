@@ -60,16 +60,23 @@ export interface ReduxLoggerOptions {
   serializeForSave?: (state: JSONObject) => JSONObject;
   deserializeOnLoad?: (blob: JSONObject, currentState: JSONObject) => JSONObject;
   /**
-   * Cross-tab state sync via redux-state-sync. Default: false.
+   * Cross-tab state sync via redux-state-sync. Default: false (off).
    *
-   * When true, every dispatched action is broadcast over a BroadcastChannel
-   * to other store instances in the same browser (other tabs, and — in dev —
-   * HMR-duplicated module instances). This is off by default because reactive
-   * effects can echo actions between stores in an unbounded feedback loop;
-   * enable it only with a suitable action blacklist and a single-store
-   * guarantee.
+   * - false (default): nothing is broadcast.
+   * - true: broadcast every action to other store instances in the same
+   *   browser — EXCEPT lo_event's own lifecycle actions (see below).
+   * - { predicate }: broadcast only actions `predicate(action)` approves
+   *   (still minus the lifecycle actions). Lets the app drop events that must
+   *   not cross tabs — e.g. content-load events, which are per-tab.
+   *
+   * Regardless of true/predicate, lo_event NEVER broadcasts its own lifecycle
+   * actions (SET_STATE — a full-state replace from blob restore — and
+   * LOCKFIELDS), since those would clobber or duplicate state across tabs.
+   *
+   * Off by default because, unfiltered, lifecycle/content actions (and
+   * non-idempotent reactive effects) echo between tabs and corrupt state.
    */
-  stateSync?: boolean;
+  stateSync?: boolean | { predicate?: (action: ReduxAction) => boolean };
 }
 
 // =============================================================================
@@ -90,6 +97,19 @@ let _options: ReduxLoggerOptions = {};
 // disabled store neither sends nor receives. Default off (opt-in).
 let _stateSyncEnabled = false;
 let _stateSyncListenerAttached = false;
+// Optional app-supplied filter for which actions to broadcast (see
+// ReduxLoggerOptions.stateSync). null = broadcast all (minus lifecycle).
+let _stateSyncPredicate: ((action: ReduxAction) => boolean) | null = null;
+
+// Whether to broadcast a given action to other tabs. lo_event NEVER broadcasts
+// its own lifecycle actions: SET_STATE (full-state replace from blob restore)
+// and LOCKFIELDS would clobber/duplicate state across tabs. The app predicate
+// filters the rest (e.g. dropping per-tab content-load events).
+function shouldBroadcast (action: ReduxAction): boolean {
+  if (!_stateSyncEnabled) return false;
+  if (action.redux_type === EMIT_SET_STATE || action.redux_type === EMIT_LOCKFIELDS) return false;
+  return _stateSyncPredicate ? _stateSyncPredicate(action) : true;
+}
 
 function ensureStateSyncListener () {
   // Browser-only: initMessageListener uses the BroadcastChannel, which is
@@ -438,7 +458,7 @@ if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
   // separately in ensureStateSyncListener(). Both respect _stateSyncEnabled.
   _baseMiddleware.push(createStateSyncMiddleware({
     channel: 'redux_state_sync',
-    predicate: () => _stateSyncEnabled,
+    predicate: (action: any) => shouldBroadcast(action as ReduxAction),
   }) as redux.Middleware);
 }
 
@@ -555,10 +575,14 @@ export function reduxLogger (subscribers?: Array<(event: unknown) => void>, opti
   }
   _options = options;
 
-  // Opt-in (default false). When enabled, attach the incoming listener (once);
-  // when disabled, the predicate above stops all outgoing broadcasts and we
-  // never attach the listener, so nothing is received.
-  _stateSyncEnabled = options.stateSync === true;
+  // Opt-in (default false). `true` or a predicate enables it; a predicate also
+  // filters which actions broadcast (see shouldBroadcast). When enabled, attach
+  // the incoming listener (once); when disabled, the predicate stops all
+  // outgoing broadcasts and we never attach the listener, so nothing is received.
+  _stateSyncEnabled = options.stateSync != null && options.stateSync !== false;
+  _stateSyncPredicate = (typeof options.stateSync === 'object' && options.stateSync !== null)
+    ? (options.stateSync.predicate ?? null)
+    : null;
   ensureStateSyncListener();
 
   const logEvent: Logger = function (event: string) {
