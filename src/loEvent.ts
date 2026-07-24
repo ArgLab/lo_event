@@ -114,6 +114,22 @@ async function lockFieldsAsync (data: Record<string, unknown>[]) {
   await Promise.all(authpromises);
 }
 
+/**
+ * Total enqueued-but-unacked events across all ack-aware loggers (currently
+ * websocketLogger). Zero means every event has been durably acknowledged by
+ * the server — the precise "is anything unsaved?" signal for a beforeunload
+ * warning, replacing the blob-based heuristic. Loggers without ack support
+ * (which confirm on send) contribute zero.
+ */
+export async function unackedCount (): Promise<number> {
+  const counts = await Promise.all(
+    loggersEnabled
+      .filter(logger => typeof logger.unackedCount === 'function')
+      .map(logger => Promise.resolve(logger.unackedCount!()))
+  );
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
 // TODO: We should consider specifying a set of verbs, nouns, etc. we
 // might use, and outlining what can be expected in the protocol
 // TODO: We should consider structing / destructing here

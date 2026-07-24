@@ -23,13 +23,18 @@
  */
 import * as debug from './debugLog.js';
 import * as util from './util.js';
+import type { LeasedItem } from './types.js';
 
 const ENQUEUE = 'enqueue';
 const DEQUEUE = 'dequeue';
+const LEASE = 'lease';
+const CONFIRM = 'confirm';
+const COUNT = 'count';
 
 interface DBOperation {
   operation: string;
   payload?: { payload: unknown };
+  uptoSeq?: number;
   resolve?: (value: unknown) => void;
   reject?: (reason?: unknown) => void;
 }
@@ -39,6 +44,12 @@ export class Queue {
   private dbOperationQueue: DBOperation[];
   private nextDBOperationPromise: ((value: DBOperation) => void) | null;
   private nextItemPromise: ((value: unknown) => void) | null;
+  // Parked lease consumer (leaseNext() called on an empty/fully-leased queue).
+  // Resolved by a subsequent enqueue (addItemToDB) or by rewind().
+  private nextLeasePromise: ((value: LeasedItem) => void) | null;
+  // Highest seq (id) handed out by leaseNext() this session. LEASE returns the
+  // lowest stored id > leasedThrough; rewind() resets it to resend unconfirmed.
+  private leasedThrough: number;
   private queueName: string;
   private dbOperationDispatch: Record<string, (op: DBOperation) => Promise<void>>;
   nextDBOperation: () => AsyncGenerator<DBOperation>;
@@ -48,20 +59,32 @@ export class Queue {
     this.dbOperationQueue = [];
     this.nextDBOperationPromise = null;
     this.nextItemPromise = null;
+    this.nextLeasePromise = null;
+    this.leasedThrough = 0;
     this.queueName = queueName;
 
     this.initialize = this.initialize.bind(this);
     this.addItemToDB = this.addItemToDB.bind(this);
     this.nextItemFromDB = this.nextItemFromDB.bind(this);
+    this.leaseFromDB = this.leaseFromDB.bind(this);
+    this.confirmInDB = this.confirmInDB.bind(this);
+    this.countInDB = this.countInDB.bind(this);
     this.nextDBOperation = util.once(this._nextDBOperation.bind(this));
     this.startProcessing = this.startProcessing.bind(this);
     this.addItemToDBOperationQueue = this.addItemToDBOperationQueue.bind(this);
     this.enqueue = this.enqueue.bind(this);
     this.dequeue = this.dequeue.bind(this);
+    this.leaseNext = this.leaseNext.bind(this);
+    this.confirm = this.confirm.bind(this);
+    this.rewind = this.rewind.bind(this);
+    this.unconfirmedCount = this.unconfirmedCount.bind(this);
 
     this.dbOperationDispatch = {
       [ENQUEUE]: this.addItemToDB,
-      [DEQUEUE]: this.nextItemFromDB
+      [DEQUEUE]: this.nextItemFromDB,
+      [LEASE]: this.leaseFromDB,
+      [CONFIRM]: this.confirmInDB,
+      [COUNT]: this.countInDB
     };
     this.initialize();
   }
@@ -130,7 +153,16 @@ export class Queue {
     const request = objectStore.add(payload);
 
     request.onsuccess = () => {
-      // successful request added
+      // A parked lease consumer (leaseNext on an empty queue) is waiting for
+      // the next item. autoIncrement assigned its id here, so hand it out now
+      // (non-destructively — it stays in the DB until confirm()ed).
+      const newId = request.result as number;
+      if (this.nextLeasePromise && newId > this.leasedThrough) {
+        const resolve = this.nextLeasePromise;
+        this.nextLeasePromise = null;
+        this.leasedThrough = newId;
+        resolve({ seq: newId, item: payload.payload });
+      }
     };
 
     request.onerror = () => {
@@ -177,6 +209,65 @@ export class Queue {
     request.onerror = () => {
       debug.error('IDBQUEUE ERROR: Error reading queue cursor:', request.error);
       reject!(request.error);
+    };
+  }
+
+  /**
+   * Lease the next item WITHOUT deleting it: the lowest-id record with
+   * id > leasedThrough. Advances leasedThrough so the next lease moves
+   * forward. If none is available, park until a matching enqueue (or a
+   * rewind) hands one over. The item stays in the DB until confirm().
+   */
+  async leaseFromDB (op: DBOperation) {
+    const { resolve, reject } = op;
+    const transaction = this.db!.transaction([this.queueName], 'readonly');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.openCursor(IDBKeyRange.lowerBound(this.leasedThrough, true));
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor) {
+        const id = cursor.key as number;
+        this.leasedThrough = id;
+        resolve!({ seq: id, item: cursor.value.payload } as LeasedItem);
+      } else {
+        // Nothing new to lease — park; addItemToDB (or rewind) resolves it.
+        this.nextLeasePromise = resolve as (value: LeasedItem) => void;
+      }
+    };
+
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error leasing queue cursor:', request.error);
+      reject!(request.error);
+    };
+  }
+
+  /**
+   * Cumulative ack: delete every stored record with id <= uptoSeq. A single
+   * ranged delete covers the whole confirmed prefix in one transaction.
+   */
+  async confirmInDB (op: DBOperation) {
+    const transaction = this.db!.transaction([this.queueName], 'readwrite');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.delete(IDBKeyRange.upperBound(op.uptoSeq!));
+
+    request.onsuccess = () => { op.resolve?.(undefined); };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error confirming (deleting) items:', request.error);
+      op.reject?.(request.error);
+    };
+  }
+
+  /** Count stored (unconfirmed) records. */
+  async countInDB (op: DBOperation) {
+    const transaction = this.db!.transaction([this.queueName], 'readonly');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.count();
+
+    request.onsuccess = () => { op.resolve!(request.result); };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error counting items:', request.error);
+      op.reject!(request.error);
     };
   }
 
@@ -247,6 +338,52 @@ export class Queue {
     return new Promise((resolve, reject) => {
       const payload = { operation: DEQUEUE, resolve, reject };
       this.addItemToDBOperationQueue(payload);
+    });
+  }
+
+  /** Lease the next unconfirmed item (non-destructive). See leaseFromDB. */
+  leaseNext (): Promise<LeasedItem> {
+    return new Promise<LeasedItem>((resolve, reject) => {
+      this.addItemToDBOperationQueue({
+        operation: LEASE,
+        resolve: resolve as (value: unknown) => void,
+        reject
+      });
+    });
+  }
+
+  /** Cumulative ack — delete everything with seq <= uptoSeq. Fire-and-forget. */
+  confirm (uptoSeq: number) {
+    this.addItemToDBOperationQueue({ operation: CONFIRM, uptoSeq });
+  }
+
+  /**
+   * Reset the lease cursor so the next lease re-hands unconfirmed items from
+   * the lowest stored id (resend on reconnect). If a lease consumer is parked
+   * (nothing was left to lease), re-issue a LEASE so it re-hands the earliest
+   * still-stored item instead of waiting for a fresh enqueue.
+   */
+  rewind () {
+    this.leasedThrough = 0;
+    if (this.nextLeasePromise) {
+      const resolve = this.nextLeasePromise;
+      this.nextLeasePromise = null;
+      this.addItemToDBOperationQueue({
+        operation: LEASE,
+        resolve: resolve as (value: unknown) => void,
+        reject: () => {}
+      });
+    }
+  }
+
+  /** Count of stored (unconfirmed) items. */
+  unconfirmedCount (): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      this.addItemToDBOperationQueue({
+        operation: COUNT,
+        resolve: resolve as (value: unknown) => void,
+        reject
+      });
     });
   }
 }

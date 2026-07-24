@@ -48,6 +48,21 @@ export class Queue {
     this.queue.enqueue(item);
   }
 
+  /** Cumulative ack: delete every leased item with seq <= uptoSeq. */
+  confirm (uptoSeq: number) {
+    this.queue.confirm(uptoSeq);
+  }
+
+  /** Reset the lease cursor so unconfirmed items are re-handed (resend). */
+  rewind () {
+    this.queue.rewind();
+  }
+
+  /** Count of enqueued-but-unconfirmed items (drives the unsaved warning). */
+  unconfirmedCount (): Promise<number> | number {
+    return this.queue.unconfirmedCount();
+  }
+
   /**
    * This function starts a loop to continually
    * dequeue items and process them appropriately
@@ -57,6 +72,7 @@ export class Queue {
     initialize = async () => true,
     shouldDequeue = async () => true,
     onDequeue = async (_item: unknown) => {},
+    onLease,
     onError = (message: string, error: unknown) => debug.error(message, error)
   }: DequeueLoopConfig = {}) {
     try {
@@ -87,7 +103,20 @@ export class Queue {
         return;
       }
 
-      // do something with the item
+      // Ack-aware lease discipline: hand the item to onLease WITHOUT deleting
+      // it. The consumer confirm()s it later (on server ack); rewind() re-hands
+      // unconfirmed items on reconnect. Nothing is lost if delivery fails.
+      if (onLease) {
+        try {
+          const leased = await this.queue.leaseNext();
+          await onLease(leased);
+        } catch (error) {
+          onError('QUEUE ERROR: Unable to lease/process item', error);
+        }
+        continue;
+      }
+
+      // Legacy destructive discipline: take-and-delete, then process.
       const item = await this.queue.dequeue();
       try {
         if (item !== null) {
