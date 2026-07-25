@@ -240,7 +240,7 @@ import { websocketLogger } from 'lo_event/websocket';
 //    for occasional events, …).
 lo_event.init('my-app', '1.0.0', [
   consoleLogger(),
-  websocketLogger({ url: 'wss://example.org/wsapi/in/' }, { requireAck: true }),
+  websocketLogger('wss://example.org/wsapi/in/', { requireAck: true }),
 ]);
 
 // 2. Optional: lock in context that rides the header — sent once, denormalized

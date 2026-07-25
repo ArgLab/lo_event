@@ -167,6 +167,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // exactly today's behavior). Held until the connection's mode is resolved.
   async function sendLeased ({ seq, item }: LeasedItem) {
     await capsGate;
+    // The gate is also resolved on disconnect (see the connection loop) to
+    // unblock a send parked in the pre-hello window. If the connection is no
+    // longer ready, do NOT send or confirm — leave the item leased-but-
+    // unconfirmed; rewind() re-hands it on the next connection. Without this,
+    // a resolved-on-disconnect gate would send on a dead socket and, in legacy
+    // mode, confirm(delete) an event that never went out.
+    if (!READY) return;
     if (ackMode) {
       socket!.send(tagSeq(item, seq));
     } else {
@@ -190,6 +197,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         // gen guard stops a stale timer from mis-flagging a newer connection.
         const myGen = ++connGen;
         const gate = capsGate;
+        const myOpen = openCapsGate;   // THIS connection's gate resolver, captured
         util.delay(HELLO_GRACE_MS).then(() => {
           if (myGen === connGen && !helloSeen) resolveNonAck('no hello within grace window');
         });
@@ -199,6 +207,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         gate.then(() => { if (myGen === connGen) queue.rewind(); });
         await socketClosed();
         READY = false;
+        // Unblock any sendLeased parked on THIS connection's gate BEFORE the next
+        // newWebsocket()/resetCaps() reassigns the shared gate and orphans it.
+        // With READY already false, the unblocked sendLeased skips (item stays
+        // unconfirmed; rewind resends it) rather than hanging the lease loop
+        // forever — the deadlock both reviewers flagged. Idempotent if the gate
+        // was already opened by hello/grace.
+        if (myOpen) myOpen();
         util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
       }
     }
