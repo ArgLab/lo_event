@@ -107,11 +107,6 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   let capsGate: Promise<void> = Promise.resolve();
   let openCapsGate: (() => void) | null = null;
   let connGen = 0;               // guards a stale grace timer against a newer connection
-  // Set when a requireAck client resolves to a non-ack server. Thrown once from
-  // the next wsLogData() call so the mis-deploy surfaces to the app (mirrors the
-  // blockerror pattern). The data itself is still enqueued (durable, held), so
-  // failing loud never loses events.
-  let ackRequiredError: Error | null = null;
   // Mirrors the sticky fatal banner state (useFatal): true once we've dispatched
   // lo_fatal, cleared when we recover (a late ack-capable hello). Not reset per
   // connection — it tracks the surfaced banner across reconnects until resolved.
@@ -139,11 +134,12 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     }
     const msg = `lo_event: server did not advertise ack (${reason}) but this client requires it — ` +
       'refusing to run legacy (would silently lose events). Fix the deploy (server needs the ack half).';
-    debug.error(msg);
-    if (!ackRequiredError) ackRequiredError = new Error(msg);   // thrown once from wsLogData
+    debug.error(msg);   // loud in the console/log
     if (!fatalActive) {
       fatalActive = true;
-      // Sticky reactive surface (useFatal → lo-blocks banner).
+      // Loud + visible via the reactive surface (useFatal → lo-blocks banner).
+      // We do NOT throw from the logging path: the event is captured either way,
+      // and throwing would only endanger delivery to sibling loggers.
       util.dispatchCustomEvent('lo_fatal', { detail: { code: 'ACK_REQUIRED', message: msg } });
     }
     // Deliberately do NOT open the gate: sendLeased stays held, so events
@@ -261,7 +257,6 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
             // Recovered — e.g. a slow ack-capable hello arrived after the grace
             // window already flagged ACK_REQUIRED. Clear the sticky banner.
             fatalActive = false;
-            ackRequiredError = null;
             util.dispatchCustomEvent('lo_fatal', { detail: null });
           }
         } else {
@@ -335,14 +330,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
 
   function wsLogData (data: string) {
     checkForBlockError();
-    // Enqueue first (durable — never lost), then scream once if a requireAck
-    // client is on an ack-less server, so the mis-deploy surfaces to the app.
+    // Capture is unconditional and durable — an event that reaches here ALWAYS
+    // makes it into the queue, regardless of gate/fatal/UX state. The requireAck
+    // mis-deploy is surfaced loudly via console.error + useFatal (reactive), NOT
+    // by throwing: sendEvent (loEvent) re-throws non-BlockError out of its
+    // fan-out over a DESTRUCTIVE front-desk queue, which would skip sibling
+    // loggers and lose the event for them — violating "every event delivered".
     queue.enqueue(data);
-    if (ackRequiredError) {
-      const e = ackRequiredError;
-      ackRequiredError = null;
-      throw e;
-    }
   }
 
   wsLogData.init = async function () {
