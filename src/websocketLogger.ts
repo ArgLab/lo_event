@@ -112,6 +112,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // blockerror pattern). The data itself is still enqueued (durable, held), so
   // failing loud never loses events.
   let ackRequiredError: Error | null = null;
+  // Mirrors the sticky fatal banner state (useFatal): true once we've dispatched
+  // lo_fatal, cleared when we recover (a late ack-capable hello). Not reset per
+  // connection — it tracks the surfaced banner across reconnects until resolved.
+  let fatalActive = false;
 
   // Per-connection reset: nothing is known about the new socket's capabilities
   // until its hello (or the grace timeout). Called from newWebsocket() before
@@ -136,9 +140,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     const msg = `lo_event: server did not advertise ack (${reason}) but this client requires it — ` +
       'refusing to run legacy (would silently lose events). Fix the deploy (server needs the ack half).';
     debug.error(msg);
-    if (!ackRequiredError) {
-      ackRequiredError = new Error(msg);
-      // Visible surface for the app (e.g. a lo-blocks error banner).
+    if (!ackRequiredError) ackRequiredError = new Error(msg);   // thrown once from wsLogData
+    if (!fatalActive) {
+      fatalActive = true;
+      // Sticky reactive surface (useFatal → lo-blocks banner).
       util.dispatchCustomEvent('lo_fatal', { detail: { code: 'ACK_REQUIRED', message: msg } });
     }
     // Deliberately do NOT open the gate: sendLeased stays held, so events
@@ -252,6 +257,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         ackMode = !!(response.capabilities && response.capabilities.ack);
         if (ackMode) {
           openGate();
+          if (fatalActive) {
+            // Recovered — e.g. a slow ack-capable hello arrived after the grace
+            // window already flagged ACK_REQUIRED. Clear the sticky banner.
+            fatalActive = false;
+            ackRequiredError = null;
+            util.dispatchCustomEvent('lo_fatal', { detail: null });
+          }
         } else {
           // Server said hello but without ack — a require-ack client must not
           // proceed in legacy.

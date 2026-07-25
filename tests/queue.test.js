@@ -42,6 +42,13 @@ describe('Queue', () => {
   });
 });
 
+// TODO(final PR review): these lease/confirm/rewind cases were load-bearing
+// while building the lease discipline (caught the rewind-parked-consumer bug),
+// but the algorithm is now stable — decide whether to keep all of them, trim to
+// the two that pin the contract (lease-doesn't-delete + cumulative-confirm), or
+// pull. They are mock-free/declarative, so low weight, but per the testing
+// philosophy a stable algorithm's tests are candidate maintenance weight.
+//
 // Ack-protocol backbone: lease is non-destructive; confirm deletes the
 // acked prefix; rewind re-hands unconfirmed items (resend on reconnect).
 describe('MemoryQueue lease / confirm / rewind', () => {
