@@ -134,12 +134,14 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     }
     const msg = `lo_event: server did not advertise ack (${reason}) but this client requires it — ` +
       'refusing to run legacy (would silently lose events). Fix the deploy (server needs the ack half).';
-    debug.error(msg);   // loud in the console/log
+    // Failure heuristic: console + localStorage + a consumer surface.
+    debug.error(msg);                                              // 1. console
     if (!fatalActive) {
       fatalActive = true;
-      // Loud + visible via the reactive surface (useFatal → lo-blocks banner).
-      // We do NOT throw from the logging path: the event is captured either way,
-      // and throwing would only endanger delivery to sibling loggers.
+      util.recordFailure({ code: 'ACK_REQUIRED', message: msg }); // 2. localStorage (bounded)
+      // 3. consumer surface — reactive useFatal → lo-blocks banner. We do NOT
+      // throw from the logging path: the event is captured either way, and
+      // throwing would only endanger delivery to sibling loggers.
       util.dispatchCustomEvent('lo_fatal', { detail: { code: 'ACK_REQUIRED', message: msg } });
     }
     // Deliberately do NOT open the gate: sendLeased stays held, so events

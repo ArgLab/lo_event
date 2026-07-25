@@ -238,6 +238,41 @@ export async function mergeMetadata (inputList: MetadataInput[]): Promise<Record
 export function delay (ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// Persistent failure log (the localStorage leg of the failure heuristic:
+// console + localStorage + consumer surface; see README "Failure handling").
+//
+// Budget by calculation, not vibes: browsers guarantee ~5 MB per origin for
+// localStorage, and lo_event already stores the redux blob there. We cap the
+// failure log at a small, fixed slice and ring-buffer it (drop oldest lines),
+// so it can never grow toward the quota no matter how many failures occur.
+// 128 K chars ≈ 256 KB (UTF-16) ≈ ~5% of the guaranteed budget — hundreds of
+// entries, leaving the rest for the app and the blob.
+const FAILURE_LOG_KEY = 'lo_event_failures';
+const FAILURE_LOG_MAX_CHARS = 128 * 1024;
+
+/**
+ * Append a failure record to a bounded, ring-buffered localStorage log
+ * (NDJSON, newest last). Deliberately NOT wired to every debug.error — only
+ * call it for notable failures worth persisting, so the log can't grow
+ * exponentially. No-op (console remains the record) outside a browser or if
+ * storage is unavailable/full.
+ */
+export function recordFailure (entry: Record<string, unknown>): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const line = JSON.stringify({ ...entry, ts: new Date().toISOString() });
+    const prev = localStorage.getItem(FAILURE_LOG_KEY) || '';
+    let next = prev ? `${prev}\n${line}` : line;
+    // Ring-buffer: drop whole oldest lines until within budget.
+    while (next.length > FAILURE_LOG_MAX_CHARS && next.includes('\n')) {
+      next = next.slice(next.indexOf('\n') + 1);
+    }
+    localStorage.setItem(FAILURE_LOG_KEY, next);
+  } catch {
+    // Quota exceeded or storage blocked — console already has it; drop.
+  }
+}
 const MS = 1;
 const SECS = 1000 * MS;
 const MINS = 60 * SECS;
