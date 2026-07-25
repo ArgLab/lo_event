@@ -98,15 +98,21 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // would silently lose it. So sendLeased awaits the gate; `hello` opens it
   // authoritatively, and a grace timeout opens it as legacy for servers that
   // never say hello.
-  const HELLO_GRACE_MS = 3000;   // comfortably > worst-case hello arrival. Legacy
-                                 // events simply wait this long in the durable
-                                 // queue before first send — harmless.
+  // Comfortably > worst-case hello arrival. Legacy events simply wait this long
+  // in the durable queue before first send — harmless (never lost). Optionally,
+  // convert to a per-logger setting when needed (e.g. a high-frequency ack-less
+  // client that wants a shorter first-send delay).
+  const HELLO_GRACE_MS = 3000;
   const requireAck = opts.requireAck ?? false;
   let ackMode = false;
   let helloSeen = false;
   let capsGate: Promise<void> = Promise.resolve();
   let openCapsGate: (() => void) | null = null;
-  let connGen = 0;               // guards a stale grace timer against a newer connection
+  // Identifies the current connection for the grace timer / gate-then callbacks.
+  // Bumped when a connection opens AND when it closes, so a previous
+  // connection's pending grace timer can't fire against a newer (still
+  // connecting) connection's capability state.
+  let connGen = 0;
   // Mirrors the sticky fatal banner state (useFatal): true once we've dispatched
   // lo_fatal, cleared when we recover (a late ack-capable hello). Not reset per
   // connection — it tracks the surfaced banner across reconnects until resolved.
@@ -213,6 +219,11 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         gate.then(() => { if (myGen === connGen) queue.rewind(); });
         await socketClosed();
         READY = false;
+        // Invalidate this connection's generation on close, so a still-pending
+        // grace timer (or gate-then) from THIS connection no-ops instead of
+        // firing against the NEXT connection's capability state while it's still
+        // connecting (connGen would otherwise be unchanged until that one opens).
+        connGen++;
         // Unblock any sendLeased parked on THIS connection's gate BEFORE the next
         // newWebsocket()/resetCaps() reassigns the shared gate and orphans it.
         // With READY already false, the unblocked sendLeased skips (item stays
