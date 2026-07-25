@@ -156,6 +156,11 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
 
   // Tag an outgoing event with its durable seq so the server can ack it.
   // Only used in ack mode; leaves non-JSON frames untouched.
+  //
+  // `seq` is a RESERVED transport field (top-level, per the wire contract the
+  // server acks against). Applications must not use a top-level `seq` on their
+  // events — the ack protocol overwrites it. Not guarded at runtime: it's a
+  // documented reserved key, not a phantom case to police per event.
   function tagSeq (item: unknown, seq: number): string {
     if (typeof item !== 'string') return JSON.stringify(item);
     try {

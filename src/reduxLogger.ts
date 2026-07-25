@@ -222,7 +222,7 @@ export function getSaveStatus (): SaveStatus { return _saveStatus; }
 /** Snapshot of connection status. null = no websocket, true/false = connected/disconnected. */
 export function getConnected (): boolean | null { return _connected; }
 
-/** Snapshot of loaded status (fetch_blob resolved or no persistence). */
+/** Snapshot of loaded status (a fetch_blob load cycle has resolved). */
 export function getLoaded (): boolean { return IS_LOADED; }
 
 /** Snapshot of the sticky fatal condition (null = none). */

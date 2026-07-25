@@ -129,12 +129,16 @@ pending input.
 
 ## Durability & the ack protocol
 
-The durable queue (IndexedDB in the browser; in-memory fallback / Node) survives
-reloads and outages. Reliability rests on a **lease discipline**, not
-delete-on-read:
+Backed by **IndexedDB** (the browser default), the queue survives reloads and
+outages — events persist across a page reload or process restart. The
+**in-memory fallback** (Node, or where IndexedDB is unavailable) survives
+in-process outages and reconnects, but not a reload/restart. Reliability rests
+on a **lease discipline**, not delete-on-read:
 
 - Every event gets a **monotonic `seq`** (the queue's autoIncrement id, durable
-  across reloads).
+  across reloads). `seq` is a **reserved** top-level transport field — don't use
+  it as an application event field; the ack protocol sets it and the server acks
+  against it.
 - **Lease, don't take:** `leaseNext()` hands an item to the sender without
   deleting it; `confirm(uptoSeq)` deletes cumulatively, only once the server acks
   that seq; `rewind()` re-hands everything un-acked on reconnect.

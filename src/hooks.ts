@@ -39,10 +39,11 @@ export function useConnected() {
 }
 
 /**
- * Whether initialization is complete (fetch_blob has resolved or
- * no persistence is configured).
+ * Whether initialization is complete (a fetch_blob load cycle has resolved).
  *
- * Use this to gate the UI — show a loading screen until true.
+ * Use this to gate the UI — show a loading screen until true. Note: a store
+ * with no fetch_blob server never resolves loaded (local-only mode is not yet
+ * supported — see reduxLogger).
  */
 export function useLoaded() {
   return useSyncExternalStore(subscribeStatus, getLoaded, () => false);
