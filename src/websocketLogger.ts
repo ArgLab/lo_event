@@ -183,6 +183,12 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   }
 
   async function startWebsocketConnectionLoop () {
+    // A websocketLogger IS configured, so establish the status as offline (false)
+    // rather than leaving it null. null means "no websocket configured / nothing
+    // persists"; without this, repeated INITIAL connect failures (never yet
+    // connected) leave it null and hide the offline indicator. setConnected
+    // dedupes, so this is a no-op once we actually connect.
+    util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
     while (true) {
       const connected = await newWebsocket();
       if (!connected) {

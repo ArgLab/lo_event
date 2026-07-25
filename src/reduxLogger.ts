@@ -84,6 +84,18 @@ export interface ReduxLoggerOptions {
    * non-idempotent reactive effects) echo between tabs and corrupt state.
    */
   stateSync?: boolean | { predicate?: (action: ReduxAction) => boolean };
+
+  /**
+   * No remote load — this store is local-only. Default false.
+   *
+   * Normally IS_LOADED flips true when a fetch_blob response arrives, and
+   * localStorage/server saves no-op until then. With no fetch_blob server that
+   * never happens: the store would never persist locally and useLoaded() would
+   * stay false forever. Set localOnly to resolve loading at init so local
+   * persistence works and the UI can un-gate. Opt-in, so remote-backed
+   * consumers are unaffected.
+   */
+  localOnly?: boolean;
 }
 
 // =============================================================================
@@ -538,6 +550,16 @@ const debouncedSaveStateToServer = debounce((state: JSONObject) => {
 // =============================================================================
 
 function initializeStore () {
+  // Local-only: no fetch_blob will arrive to flip IS_LOADED, so resolve loading
+  // here. Without this, localStorage saves no-op forever and useLoaded() never
+  // becomes true. Remote-backed stores leave localOnly false and load on
+  // fetch_blob as before.
+  if (_options.localOnly && !IS_LOADED) {
+    IS_LOADED = true;
+    markSaved();
+    notifyStatusListeners();  // loaded changed
+  }
+
   // The subscription is read-only — it never dispatches to the store.
   // Save status lives in a plain module-level variable (see above),
   // avoiding cross-tab loops via redux-state-sync.
