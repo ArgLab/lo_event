@@ -12,6 +12,21 @@ interface WsHostOverrides {
   url?: string;
 }
 
+interface WsLoggerOptions {
+  /**
+   * Whether this client REQUIRES the server's ack capability. Default false.
+   *
+   * false (writing_observer, other ack-less consumers): if ack isn't
+   *   advertised, fall back to legacy send-and-delete (graceful degrade).
+   * true (lo-blocks): if the server doesn't advertise `ack` (no `hello`,
+   *   `hello` without it, or the grace window expires), FAIL LOUDLY — throw +
+   *   visible error, and do NOT run legacy. A require-ack client on an
+   *   ack-less server is a mis-deploy; running legacy silently loses events,
+   *   which is the exact bug this protocol fixes. Fail fast, never run bad code.
+   */
+  requireAck?: boolean;
+}
+
 function wsHost(overrides: WsHostOverrides = {}, loc = window.location) {
   const { hostname, port, path, url } = overrides;
   const protocol = loc.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -24,7 +39,7 @@ function wsHost(overrides: WsHostOverrides = {}, loc = window.location) {
 }
 
 
-export function websocketLogger (server: string | WsHostOverrides = {}): Logger {
+export function websocketLogger (server: string | WsHostOverrides = {}, opts: WsLoggerOptions = {}): Logger {
   /*
     This is a pretty complex logger, which sends events over a web
     socket.
@@ -86,11 +101,17 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
   const HELLO_GRACE_MS = 3000;   // comfortably > worst-case hello arrival. Legacy
                                  // events simply wait this long in the durable
                                  // queue before first send — harmless.
+  const requireAck = opts.requireAck ?? false;
   let ackMode = false;
   let helloSeen = false;
   let capsGate: Promise<void> = Promise.resolve();
   let openCapsGate: (() => void) | null = null;
   let connGen = 0;               // guards a stale grace timer against a newer connection
+  // Set when a requireAck client resolves to a non-ack server. Thrown once from
+  // the next wsLogData() call so the mis-deploy surfaces to the app (mirrors the
+  // blockerror pattern). The data itself is still enqueued (durable, held), so
+  // failing loud never loses events.
+  let ackRequiredError: Error | null = null;
 
   // Per-connection reset: nothing is known about the new socket's capabilities
   // until its hello (or the grace timeout). Called from newWebsocket() before
@@ -102,6 +123,26 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
   }
   function openGate () {
     if (openCapsGate) { openCapsGate(); openCapsGate = null; }
+  }
+
+  // The connection resolved to NO ack capability (no hello / hello without ack /
+  // grace expired). requireAck clients fail loud and refuse legacy; others fall
+  // back to legacy send-and-delete.
+  function resolveNonAck (reason: string) {
+    if (!requireAck) {
+      openGate();   // legacy fallback (ackMode already false)
+      return;
+    }
+    const msg = `lo_event: server did not advertise ack (${reason}) but this client requires it — ` +
+      'refusing to run legacy (would silently lose events). Fix the deploy (server needs the ack half).';
+    debug.error(msg);
+    if (!ackRequiredError) {
+      ackRequiredError = new Error(msg);
+      // Visible surface for the app (e.g. a lo-blocks error banner).
+      util.dispatchCustomEvent('lo_fatal', { detail: { code: 'ACK_REQUIRED', message: msg } });
+    }
+    // Deliberately do NOT open the gate: sendLeased stays held, so events
+    // accumulate in the durable queue rather than going out un-acked and lost.
   }
 
   // Tag an outgoing event with its durable seq so the server can ack it.
@@ -147,7 +188,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
         const myGen = ++connGen;
         const gate = capsGate;
         util.delay(HELLO_GRACE_MS).then(() => {
-          if (myGen === connGen && !helloSeen) openGate();   // legacy: ackMode stays false
+          if (myGen === connGen && !helloSeen) resolveNonAck('no hello within grace window');
         });
         // Resend unconfirmed items only after the mode is known, so nothing is
         // handed to sendLeased (including the rewind-woken parked consumer) while
@@ -209,7 +250,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
         // (a late hello, after the grace timeout, still upgrades later sends).
         helloSeen = true;
         ackMode = !!(response.capabilities && response.capabilities.ack);
-        openGate();
+        if (ackMode) {
+          openGate();
+        } else {
+          // Server said hello but without ack — a require-ack client must not
+          // proceed in legacy.
+          resolveNonAck('hello without ack capability');
+        }
         debug.info(`websocket hello; ack mode ${ackMode ? 'on' : 'off'}`);
         break;
       case 'ack':
@@ -276,7 +323,14 @@ export function websocketLogger (server: string | WsHostOverrides = {}): Logger 
 
   function wsLogData (data: string) {
     checkForBlockError();
+    // Enqueue first (durable — never lost), then scream once if a requireAck
+    // client is on an ack-less server, so the mis-deploy surfaces to the app.
     queue.enqueue(data);
+    if (ackRequiredError) {
+      const e = ackRequiredError;
+      ackRequiredError = null;
+      throw e;
+    }
   }
 
   wsLogData.init = async function () {
