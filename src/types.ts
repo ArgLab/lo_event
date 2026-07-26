@@ -42,6 +42,8 @@ export interface Logger {
   getLockFields?: () => Record<string, unknown> | null;
   /** Enqueued-but-unacked count (ack-aware loggers, e.g. websocketLogger). */
   unackedCount?: () => Promise<number> | number;
+  /** Console debug handles for this logger's durable queue, if it has one. */
+  queueDebug?: QueueDebug;
 }
 
 /**
@@ -79,6 +81,13 @@ export interface LeasedItem {
  * A given Queue instance uses ONE discipline; mixing them on one instance is
  * unsupported.
  */
+/** Console-facing handles for a durable queue (see loEvent.queueDebug). */
+export interface QueueDebug {
+  count(): Promise<number> | number;
+  inspect(limit?: number): Promise<unknown[]>;
+  clear(): void;
+}
+
 export interface QueueBackend {
   enqueue(item: unknown): void;
   dequeue(): unknown | Promise<unknown>;
@@ -99,6 +108,14 @@ export interface QueueBackend {
   rewind(): void;
   /** Count of stored (enqueued, not yet confirmed) items. */
   unconfirmedCount(): Promise<number> | number;
+  /** DEBUG: the first `limit` stored items, without leasing or deleting.
+   *  For answering "what is stuck in there, and why?" from a console. */
+  inspect(limit: number): Promise<unknown[]>;
+  /** DEBUG / RECOVERY: drop everything, unsent included. Destructive and
+   *  deliberately so — the use case is a queue holding junk (e.g. frames a
+   *  broken build could never get acked) that would otherwise be resent on
+   *  every reconnect forever. */
+  clear(): void;
 }
 
 /**

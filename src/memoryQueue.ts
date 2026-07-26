@@ -45,6 +45,15 @@ export class Queue {
   async initialize () {
   }
 
+  async inspect (limit: number): Promise<unknown[]> {
+    return this.items.slice(0, limit).map(e => ({ seq: e.seq, payload: e.payload }));
+  }
+
+  clear () {
+    this.items = [];
+    this.leasedThrough = 0;
+  }
+
   enqueue (item: unknown) {
     const entry: Entry = { seq: this.nextSeq++, payload: item };
     if (this.waiter) {

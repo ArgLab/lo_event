@@ -30,11 +30,14 @@ const DEQUEUE = 'dequeue';
 const LEASE = 'lease';
 const CONFIRM = 'confirm';
 const COUNT = 'count';
+const INSPECT = 'inspect';
+const CLEAR = 'clear';
 
 interface DBOperation {
   operation: string;
   payload?: { payload: unknown };
   seqs?: number[];
+  limit?: number;
   resolve?: (value: unknown) => void;
   reject?: (reason?: unknown) => void;
 }
@@ -64,6 +67,8 @@ export class Queue {
     this.queueName = queueName;
 
     this.initialize = this.initialize.bind(this);
+    this.inspectInDB = this.inspectInDB.bind(this);
+    this.clearInDB = this.clearInDB.bind(this);
     this.addItemToDB = this.addItemToDB.bind(this);
     this.nextItemFromDB = this.nextItemFromDB.bind(this);
     this.leaseFromDB = this.leaseFromDB.bind(this);
@@ -81,6 +86,8 @@ export class Queue {
 
     this.dbOperationDispatch = {
       [ENQUEUE]: this.addItemToDB,
+      [INSPECT]: this.inspectInDB,
+      [CLEAR]: this.clearInDB,
       [DEQUEUE]: this.nextItemFromDB,
       [LEASE]: this.leaseFromDB,
       [CONFIRM]: this.confirmInDB,
@@ -288,6 +295,39 @@ export class Queue {
     };
   }
 
+  /** DEBUG: the first `limit` stored records, without leasing or deleting.
+   *  Answers "what is stuck in there?" — which is how an unackable frame gets
+   *  diagnosed, since the symptom (a queue that only grows) is otherwise
+   *  indistinguishable from being offline. */
+  async inspectInDB (op: DBOperation) {
+    const transaction = this.db!.transaction([this.queueName], 'readonly');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.getAll(undefined, op.limit ?? 20);
+
+    request.onsuccess = () => { op.resolve!(request.result); };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error inspecting items:', request.error);
+      op.reject!(request.error);
+    };
+  }
+
+  /** DEBUG / RECOVERY: drop every stored record, unsent included. */
+  async clearInDB (op: DBOperation) {
+    const transaction = this.db!.transaction([this.queueName], 'readwrite');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.clear();
+
+    request.onsuccess = () => {
+      this.leasedThrough = 0;
+      debug.info('idbQueue: queue cleared');
+      op.resolve?.(undefined);
+    };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error clearing queue:', request.error);
+      op.reject?.(request.error);
+    };
+  }
+
   /**
    * The processing loop continually waits for the next
    * dbOperation to come using the following generator.
@@ -367,6 +407,18 @@ export class Queue {
         reject
       });
     });
+  }
+
+  /** DEBUG: peek at stored records without consuming them. */
+  inspect (limit = 20): Promise<unknown[]> {
+    return new Promise<unknown>((resolve, reject) => {
+      this.addItemToDBOperationQueue({ operation: INSPECT, limit, resolve, reject });
+    }) as Promise<unknown[]>;
+  }
+
+  /** DEBUG / RECOVERY: drop everything. Fire-and-forget. */
+  clear () {
+    this.addItemToDBOperationQueue({ operation: CLEAR });
   }
 
   /** Delete exactly these stored ids. Fire-and-forget. */

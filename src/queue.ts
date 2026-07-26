@@ -64,6 +64,16 @@ export class Queue {
     return this.queue.unconfirmedCount();
   }
 
+  /** DEBUG: peek at what is sitting in the queue. */
+  inspect (limit = 20): Promise<unknown[]> {
+    return this.queue.inspect(limit);
+  }
+
+  /** DEBUG / RECOVERY: drop everything, unsent included. */
+  clear () {
+    this.queue.clear();
+  }
+
   /**
    * This function starts a loop to continually
    * dequeue items and process them appropriately

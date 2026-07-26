@@ -204,7 +204,19 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // `seq` here is the STORAGE id — it stays local. The event travels
       // untouched; the server acks the name the event already carries.
       const id = eventIdOf(item);
-      if (id !== null) inFlight.set(id, seq);
+      if (id === null) {
+        // Unnameable frame: the server cannot ack what it cannot name, so this
+        // record would never be confirmed, never deleted, and resent on every
+        // reconnect. Loud, because the symptom (a queue that grows forever) is
+        // otherwise indistinguishable from being offline.
+        debug.error(
+          'WEBSOCKET: frame has no metadata.eventId; it can never be acked or ' +
+          'deleted. Every enqueued frame must be stamped (see enqueueOwnFrame).',
+          item
+        );
+      } else {
+        inFlight.set(id, seq);
+      }
       socket!.send(item as string);
     } else {
       socket!.send(item as string);
@@ -284,9 +296,22 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     return wsConnectedPromise;
   }
 
+  // Frames this logger constructs itself (as opposed to events handed down
+  // already stamped by loEvent.logEvent). They MUST be stamped too: an ack
+  // names metadata.eventId, so an unnamed frame can never be acked, and a
+  // record that is never acked is never deleted. It sits in the durable queue
+  // forever and is resent on every reconnect. save_blob fires on every state
+  // save, so "unnamed" shows up as a queue that only grows.
+  function enqueueOwnFrame (frame: Record<string, unknown>) {
+    util.timestampEvent(frame);
+    queue.enqueue(JSON.stringify(frame));
+  }
+
   function prepareSocket () {
     if(Object.keys(metadata).length > 0) {
-      queue.enqueue(JSON.stringify(metadata));
+      // Copy: timestampEvent would otherwise stamp the long-lived metadata
+      // dict itself, and every later send would carry the first frame's id.
+      enqueueOwnFrame({ ...metadata });
     }
   }
 
@@ -437,6 +462,14 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // (in ack mode; legacy confirms on send so this trends to zero immediately).
   wsLogData.unackedCount = function () { return queue.unconfirmedCount(); };
 
+  // Debug surface for this logger's durable queue. Reached from a console via
+  // lo_event.queueDebug() — see loEvent.ts.
+  wsLogData.queueDebug = {
+    count: () => queue.unconfirmedCount(),
+    inspect: (limit = 20) => queue.inspect(limit),
+    clear: () => queue.clear(),
+  };
+
   wsLogData.setField = function (data: string) {
     util.mergeDictionary(metadata, JSON.parse(data));
     queue.enqueue(data);
@@ -444,7 +477,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
 
   function handleSaveBlob (data: unknown) {
     const { blob, token } = data as { blob: unknown; token: number };
-    queue.enqueue(JSON.stringify({ event: 'save_blob', blob, token }));
+    enqueueOwnFrame({ event: 'save_blob', blob, token });
   }
 
   util.consumeCustomEvent('save_blob', handleSaveBlob);

@@ -3,6 +3,7 @@
 */
 
 import { timestampEvent, mergeMetadata } from './util.js';
+import type { QueueDebug } from './types.js';
 import { getBrowserInfo } from './metadata/browserinfo.js';
 import * as Queue from './queue.js';
 import * as disabler from './disabler.js';
@@ -128,6 +129,30 @@ export async function unackedCount (): Promise<number> {
       .map(logger => Promise.resolve(logger.unackedCount!()))
   );
   return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * DEBUG handles for the durable queues, for use from a browser console.
+ *
+ *   const q = lo_event.queueDebug()[0];
+ *   await q.count();          // how many events are waiting
+ *   await q.inspect();        // WHAT is waiting — the first 20 records
+ *   q.clear();                // drop everything, unsent included
+ *
+ * `inspect` earns its place: a queue that only grows looks identical whether
+ * the client is offline, the server is refusing to ack, or a frame was
+ * enqueued that can never BE acked. Reading the stuck records distinguishes
+ * them in seconds.
+ *
+ * `clear` is destructive and meant to be: it exists for recovering a queue
+ * holding junk a broken build left behind, which would otherwise be resent on
+ * every reconnect forever. It discards unsent events — never call it on a
+ * queue you believe holds real work.
+ */
+export function queueDebug (): QueueDebug[] {
+  return loggersEnabled
+    .filter(logger => logger.queueDebug)
+    .map(logger => logger.queueDebug!);
 }
 
 // TODO: We should consider specifying a set of verbs, nouns, etc. we
