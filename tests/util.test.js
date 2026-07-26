@@ -96,3 +96,47 @@ describe('util.js testing', () => {
     expect(util.copyFields(source, fields)).toEqual({ foo: 'bar' });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Event identity
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// eventId is what the ack protocol names, so these are protocol invariants
+// rather than debugging conveniences: an ack that cannot be matched back to a
+// record is an event that never gets deleted (resent forever) or, worse, the
+// wrong record deleted.
+
+describe('event identity', () => {
+  it('stamps <browser>.<session>.<seq>, and the parts agree with the composite', () => {
+    const e = { event: 'ADD' };
+    util.timestampEvent(e);
+    const m = e.metadata;
+
+    expect(m.eventId).toBe(`${m.browserTag}.${m.sessionTag}.${m.sessionSeq}`);
+    expect(typeof m.sessionSeq).toBe('number');
+  });
+
+  it('the sequence advances per event, and the session tag does not', () => {
+    const a = { event: 'A' }; const b = { event: 'B' };
+    util.timestampEvent(a);
+    util.timestampEvent(b);
+
+    expect(b.metadata.sessionSeq).toBe(a.metadata.sessionSeq + 1);
+    expect(b.metadata.sessionTag).toBe(a.metadata.sessionTag);
+    expect(b.metadata.eventId).not.toBe(a.metadata.eventId);
+  });
+
+  it('identity survives verboseEvents being off — it is not a debug extra', () => {
+    // Turning off verbose logging must not turn off the ack protocol's ability
+    // to name an event. Identity used to live inside this flag.
+    util.setVerboseEvents(false);
+    try {
+      const e = { event: 'QUIET' };
+      util.timestampEvent(e);
+      expect(e.metadata.eventId).toBeTruthy();
+      expect(e.metadata.human_ts).toBeUndefined();   // verbose extras gone
+    } finally {
+      util.setVerboseEvents(true);
+    }
+  });
+});

@@ -256,20 +256,23 @@ export class Queue {
     if (!seqs.length) { op.resolve?.(undefined); return; }
     const transaction = this.db!.transaction([this.queueName], 'readwrite');
     const objectStore = transaction.objectStore(this.queueName);
-    let pending = seqs.length;
-    let failed: unknown = null;
 
     for (const id of seqs) {
       const request = objectStore.delete(id);
-      request.onsuccess = () => {
-        if (--pending === 0 && !failed) op.resolve?.(undefined);
-      };
       request.onerror = () => {
-        failed = request.error;
         debug.error('IDBQUEUE ERROR: Error confirming (deleting) item:', request.error);
-        if (--pending === 0) op.reject?.(failed);
       };
     }
+
+    // Settle on the TRANSACTION, not on the individual deletes. Counting
+    // per-request callbacks has a hole: if a middle delete fails and a later
+    // one succeeds, the success path skips resolve (an error was recorded) and
+    // the error path already ran while others were outstanding — so neither
+    // fires and the promise hangs forever. Harmless while confirm() is
+    // fire-and-forget, and a trap for the first caller who awaits it.
+    transaction.oncomplete = () => { op.resolve?.(undefined); };
+    transaction.onerror = () => { op.reject?.(transaction.error); };
+    transaction.onabort = () => { op.reject?.(transaction.error); };
   }
 
   /** Count stored (unconfirmed) records. */

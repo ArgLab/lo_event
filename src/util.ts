@@ -116,7 +116,8 @@ export function setVerboseEvents(value: boolean): void {
  *  event = { event: 'ADD', data: 'stuff' }
  *  timestampEvent(event)
  *  event
- *  // { event: 'ADD', data: 'stuff', metadata: { ts, human_ts, iso_ts, sessionIndex, sessionTag } }
+ *  // { event: 'ADD', data: 'stuff', metadata: { ts, human_ts, iso_ts, eventId,
+ *  //                                              browserTag, sessionTag, sessionSeq } }
  */
 export function timestampEvent (event: Record<string, unknown>): void {
   if (!event.metadata) {
@@ -125,12 +126,33 @@ export function timestampEvent (event: Record<string, unknown>): void {
 
   const metadata = event.metadata as Record<string, unknown>;
   metadata.iso_ts = new Date().toISOString();
+
+  // IDENTITY — always stamped, never gated on verboseEvents.
+  //
+  // `eventId` is `<browser>.<session>.<seq>`, and it is the name the ack
+  // protocol references, so it is load-bearing rather than a debugging
+  // nicety. Three properties earn it that job:
+  //   - it means the same thing to everyone, forever (unlike a per-connection
+  //     counter, which is meaningful only to the socket that issued it), so an
+  //     ack is a fact about the world: "the server durably has this event";
+  //   - any tab can therefore act on an ack for a record it did not send —
+  //     which is what lets one tab drain another's leftovers safely;
+  //   - it survives reconnects, so a server can eventually say "I already have
+  //     <session> through <seq>" and skip a resend.
+  //
+  // `session` is one JS CONTEXT's lifetime — a page load, an extension
+  // background page, a worker, a node process. Deliberately not "tab": lo_event
+  // runs where there is no tab, and a name that is false in a real deployment
+  // is worse than a slightly abstract one.
+  const seq = eventIndex++;
+  metadata.browserTag = browserStamp();
+  metadata.sessionTag = sessionStamp;
+  metadata.sessionSeq = seq;
+  metadata.eventId = `${metadata.browserTag as string}.${sessionStamp}.${seq}`;
+
   if(verboseEvents) {
     metadata.ts = Date.now();
     metadata.human_ts = Date();
-    metadata.sessionIndex = eventIndex++;
-    metadata.sessionTag = sessionStamp;
-    metadata.browserTag = browserStamp();
   }
 }
 

@@ -154,61 +154,38 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // accumulate in the durable queue rather than going out un-acked and lost.
   }
 
-  // THREE NUMBERS, THREE SCOPES — do not collapse them again.
+  // TWO NUMBERS, TWO SCOPES.
   //
-  //   1. storage id   — the queue's own key. Scope: this browser's shared
-  //                     store. Orders and leases. NEVER goes on the wire: it
-  //                     is meaningless outside that database.
-  //   2. wire seq     — `wireSeq` below. Scope: ONE connection, restarting at
-  //                     1 each time. This is what the server acks.
-  //   3. identity     — [browser].[tab].[seq] (browserTag / sessionTag /
-  //                     sessionIndex, already stamped on every event). Scope:
-  //                     forever. For dedup, analytics, forensics. Never used
-  //                     for acks or deletes.
+  //   1. storage id — the queue's own key. Scope: this browser's shared store.
+  //                   Orders and leases. Never goes on the wire: it is
+  //                   meaningless outside that database.
+  //   2. identity   — metadata.eventId, `<browser>.<session>.<seq>`, stamped at
+  //                   creation. Scope: forever. This is what the server acks.
   //
-  // Collapsing 1 and 2 was the bug: cumulative acking is only sound when the
-  // acknowledged sequence belongs to exactly one connection, and the storage
-  // id is shared by every tab. A per-connection counter is owned by one
-  // connection BY CONSTRUCTION, so there is nothing to coordinate.
+  // There is deliberately no third, transport-level sequence. An ack keyed on
+  // identity is a fact anyone can act on ("the server durably has this event"),
+  // where a per-connection counter is meaningful only to the socket that
+  // issued it — its meaning dies with that socket, which is exactly wrong for
+  // a store shared by tabs that drain each other's leftovers. It also lets a
+  // server eventually say "I have <session> through <seq>" across a reconnect.
   //
-  // `sentThisConn` maps wire seq -> storage id for what this socket has sent
-  // and not yet had acked. It is the precise answer to "what may I delete?",
-  // and it is discarded on disconnect: unacked records simply stay in the
-  // store and are re-sent (under fresh wire seqs) after rewind().
-  let wireSeq = 0;
-  const sentThisConn = new Map<number, number>();
+  // Consequence worth noticing: nothing tags or rewrites the outgoing frame
+  // any more. Events go out verbatim, because they already carry their name.
+  //
+  // `inFlight` maps eventId -> storage id for what has been sent and not yet
+  // acked. It is NOT reset per connection: an identity means the same thing on
+  // every connection, and a resend simply rewrites the same entry. Deleting is
+  // then exactly "the record this ack names", never a range and never a guess.
+  const inFlight = new Map<string, number>();
 
-  function resetConnectionSeq () {
-    wireSeq = 0;
-    sentThisConn.clear();
-  }
-
-  /** Storage ids this connection sent with wire seq <= n (cumulative ack). */
-  function drainAcked (n: number): number[] {
-    const ids: number[] = [];
-    for (const [w, storageId] of sentThisConn) {
-      if (w <= n) { ids.push(storageId); sentThisConn.delete(w); }
-    }
-    return ids;
-  }
-
-  // Tag an outgoing event with its wire seq so the server can ack it.
-  // Only used in ack mode; leaves non-JSON frames untouched.
-  //
-  // `seq` is a RESERVED transport field (top-level, per the wire contract the
-  // server acks against). Applications must not use a top-level `seq` on their
-  // events — the ack protocol overwrites it. Not guarded at runtime: it's a
-  // documented reserved key, not a phantom case to police per event.
-  function tagSeq (item: unknown, seq: number): string {
-    if (typeof item !== 'string') return JSON.stringify(item);
+  /** The event's own name, or null for frames we cannot read. */
+  function eventIdOf (item: unknown): string | null {
+    if (typeof item !== 'string') return null;
     try {
       const obj = JSON.parse(item);
-      if (obj && typeof obj === 'object') {
-        obj.seq = seq;
-        return JSON.stringify(obj);
-      }
-    } catch { /* not JSON — can't tag, send verbatim */ }
-    return item;
+      const id = obj?.metadata?.eventId;
+      return typeof id === 'string' ? id : null;
+    } catch { return null; }
   }
 
   // Send a leased item. Ack mode: tag with seq and keep it queued until the
@@ -224,10 +201,11 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // mode, confirm(delete) an event that never went out.
     if (!READY) return;
     if (ackMode) {
-      // `seq` is the STORAGE id; the wire carries this connection's own counter.
-      const w = ++wireSeq;
-      sentThisConn.set(w, seq);
-      socket!.send(tagSeq(item, w));
+      // `seq` here is the STORAGE id — it stays local. The event travels
+      // untouched; the server acks the name the event already carries.
+      const id = eventIdOf(item);
+      if (id !== null) inFlight.set(id, seq);
+      socket!.send(item as string);
     } else {
       socket!.send(item as string);
       queue.confirm([seq]);
@@ -248,10 +226,6 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         await util.delay(calculateExponentialBackoff(failures));
       } else {
         READY = true;
-        // New connection: the wire seq restarts at 1 and nothing is in flight.
-        // Anything the previous socket sent but never had acked is still in the
-        // store (we only ever delete on ack), so rewind() re-hands it below.
-        resetConnectionSeq();
         failures = 0;
         util.dispatchCustomEvent('lo_connection_status', { detail: { connected: true } });
         // Resolve this connection's capability mode, THEN resend. hello opens the
@@ -350,12 +324,18 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         }
         debug.info(`websocket hello; ack mode ${ackMode ? 'on' : 'off'}`);
         break;
-      case 'ack':
-        // Cumulative: the server durably wrote everything through response.seq.
-        if (typeof response.seq === 'number') {
-          queue.confirm(drainAcked(response.seq));
+      case 'ack': {
+        // The server durably wrote the event it names. Delete exactly that one.
+        const acked = response.id;
+        if (typeof acked === 'string') {
+          const storageId = inFlight.get(acked);
+          if (storageId !== undefined) {
+            inFlight.delete(acked);
+            queue.confirm([storageId]);
+          }
         }
         break;
+      }
       case 'blocklist':
         debug.info('Received block error from server');
         blockerror = new disabler.BlockError(
