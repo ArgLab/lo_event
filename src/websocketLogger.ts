@@ -3,6 +3,7 @@ import * as disabler from './disabler.js';
 import * as util from './util.js';
 import * as debug from './debugLog.js';
 import { storage } from './browserStorage.js';
+import { StateRequest } from './stateRequest.js';
 import type { Logger, LeasedItem } from './types.js';
 
 interface WsHostOverrides {
@@ -198,29 +199,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // is still outstanding. Re-asking is free (the request is idempotent) and it
   // makes reconnect self-healing instead of terminal.
   const STATE_REQUEST = 'fetch_blob';
-  // SINGLE OUTSTANDING REQUEST. Only one state snapshot is ever in flight —
-  // today only ReduxStoreLoader asks, once. A second distinct request before
-  // the first is answered would silently replace this slot; if per-document
-  // fetches ever arrive, this becomes a map keyed by what is being requested.
-  let outstandingStateRequest: string | null = null;
-
-  // SNAPSHOT AFTER FLUSH. The request must reach the server AFTER the recovered
-  // backlog, or the snapshot predates the client's own last keystrokes: the
-  // server folds the tail afterwards but never echoes it back (no-echo), so the
-  // UI would show stale state until another reload — losing exactly the tail
-  // that durable recovery just saved.
-  //
-  // Ordering is by ARRIVAL on the connection (the server folds serially), so
-  // the backlog need only be SENT first, not acked. Gating on "queue empty"
-  // instead would starve on a busy client, which never empties.
-  //
-  // The backlog is whatever was already stored when this connection
-  // authenticated. Leases hand out records in ascending storage id and new
-  // events get higher ids, so the first `backlogAtAuth` records sent on this
-  // connection ARE the backlog — a plain count is enough, and it is bounded, so
-  // ongoing typing cannot defer the snapshot forever.
-  let backlogAtAuth = 0;
-  let sentThisConn = 0;
+  // The rules and the reasons live in stateRequest.ts, along with the tests.
+  // Loose counters and flags in this file are what produced three regressions
+  // in a row, none of them reachable by a test from here.
+  const stateRequest = new StateRequest();
 
   function isStateRequest (item: unknown): boolean {
     if (typeof item !== 'string') return false;
@@ -232,10 +214,15 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     try { return JSON.parse(item)?.event === STATE_REQUEST; } catch { return false; }
   }
 
+  /** One record left this connection; the backlog may have just finished. */
+  function countSend () {
+    stateRequest.sentRecord();
+    sendStateRequest();
+  }
+
   function sendStateRequest () {
-    if (READY && outstandingStateRequest !== null && sentThisConn >= backlogAtAuth) {
-      socket!.send(outstandingStateRequest);
-    }
+    if (!READY) return;
+    if (stateRequest.shouldSend()) socket!.send(stateRequest.frame()!);
   }
 
   /** The event's own name, or null for frames we cannot read. */
@@ -290,8 +277,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         );
         socket!.send(item as string);
         queue.confirm([seq]);
-        sentThisConn++;
-        if (outstandingStateRequest !== null) sendStateRequest();
+        countSend();
         return;
       }
       // NOTE: an entry can linger if another tab ends up delivering this record
@@ -301,12 +287,15 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // whole point of acking by name.
       inFlight.set(id, seq);
       socket!.send(item as string);
-      sentThisConn++;
-      // The backlog may have just finished going out.
-      if (outstandingStateRequest !== null) sendStateRequest();
+      countSend();
     } else {
       socket!.send(item as string);
       queue.confirm([seq]);
+      // Legacy mode counts too. Counting only in ack mode meant the backlog
+      // barrier could never be satisfied here, so the state request was never
+      // sent at all — a permanent "loading" for ack-less deployments, which is
+      // the path that worked before any of this.
+      countSend();
     }
   }
 
@@ -324,6 +313,24 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         await util.delay(calculateExponentialBackoff(failures));
       } else {
         READY = true;
+        // Per-connection state for the snapshot barrier, captured HERE —
+        // before the capability gate opens and the lease loop can send
+        // anything. Counting from connection start is also self-consistent:
+        // any record an ack deletes mid-drain was necessarily already sent on
+        // this connection, so it is already in the counter.
+        stateRequest.connected();
+        void Promise.resolve(queue.unconfirmedCount())
+          .then((n) => {
+            stateRequest.backlogMeasured(n);
+            sendStateRequest();   // backlog may already be empty
+          })
+          .catch((err) => {
+            // An unreadable count must not strand the snapshot forever: fall
+            // back to no barrier, which is the pre-barrier behavior.
+            debug.error('WEBSOCKET: could not measure backlog; asking for state without the barrier', err);
+            stateRequest.backlogMeasured(0);
+            sendStateRequest();
+          });
         failures = 0;
         util.dispatchCustomEvent('lo_connection_status', { detail: { connected: true } });
         // Resolve this connection's capability mode, THEN resend. hello opens the
@@ -341,6 +348,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         gate.then(() => { if (myGen === connGen) queue.rewind(); });
         await socketClosed();
         READY = false;
+        stateRequest.disconnected();
         // Invalidate this connection's generation on close, so a still-pending
         // grace timer (or gate-then) from THIS connection no-ops instead of
         // firing against the NEXT connection's capability state while it's still
@@ -468,15 +476,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         const { status, ...user } = response;
         storage.set(user);
         util.dispatchCustomEvent('auth', { detail: user });
-        // Auth lands once per connection and is what the server needs before
-        // it can route a state request, so this is the moment to (re-)ask if we
-        // are still waiting for one — but only once this connection has pushed
-        // the backlog that was already waiting. See "snapshot after flush".
-        void Promise.resolve(queue.unconfirmedCount()).then((n) => {
-          backlogAtAuth = n;
-          sentThisConn = 0;
-          sendStateRequest();
-        });
+        // Auth is what the server needs before it can route a state request,
+        // so this is a trigger to (re-)ask — but it owns none of the
+        // bookkeeping, which belongs to the connection (see READY above).
+        sendStateRequest();
         break;
       }
       // These should probably be behind a feature flag, as they assume
@@ -488,7 +491,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         util.dispatchCustomEvent(response.event_type, { detail: response.detail });
         break;
       case 'fetch_blob':
-        outstandingStateRequest = null;   // answered; stop re-asking
+        stateRequest.fulfilled();   // answered; stop re-asking
         util.dispatchCustomEvent('fetch_blob', { detail: response.data });
         break;
       case 'save_blob_ack':
@@ -522,9 +525,9 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // fan-out over a DESTRUCTIVE front-desk queue, which would skip sibling
     // loggers and lose the event for them — violating "every event delivered".
     if (isStateRequest(data)) {
-      // Connection-scoped: remembered, sent now, re-sent on reconnect —
-      // never persisted. See outstandingStateRequest above.
-      outstandingStateRequest = data;
+      // Connection-scoped: remembered, sent when the backlog is out, re-sent on
+      // reconnect — never persisted. See stateRequest.ts.
+      stateRequest.request(data);
       sendStateRequest();
       return;
     }
