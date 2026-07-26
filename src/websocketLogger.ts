@@ -178,6 +178,39 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // then exactly "the record this ack names", never a range and never a guess.
   const inFlight = new Map<string, number>();
 
+  // CONNECTION-SCOPED RPC — deliberately NOT durable.
+  //
+  // A state snapshot request (fetch_blob) is a property of a CONNECTION, not of
+  // durable history: its answer comes back on the socket that asked, once, and
+  // is worthless to anyone else. Putting it in the durable queue produced two
+  // hangs that both end in "Loading user state..." forever:
+  //
+  //   1. The queue is shared across tabs, so ANOTHER tab could lease the
+  //      request and send it on ITS socket. The server answered that tab. The
+  //      tab that actually needed the state waited for a reply addressed
+  //      elsewhere.
+  //   2. Acks are durable-capture, not request-fulfilment. If the socket
+  //      dropped after the ack but before the response frame, the record was
+  //      deleted as safely delivered while the answer never arrived — and
+  //      nothing re-asked.
+  //
+  // So: never queued, sent directly, and re-sent on every connection while it
+  // is still outstanding. Re-asking is free (the request is idempotent) and it
+  // makes reconnect self-healing instead of terminal.
+  const STATE_REQUEST = 'fetch_blob';
+  let outstandingStateRequest: string | null = null;
+
+  function isStateRequest (item: unknown): boolean {
+    if (typeof item !== 'string') return false;
+    try { return JSON.parse(item)?.event === STATE_REQUEST; } catch { return false; }
+  }
+
+  function sendStateRequest () {
+    if (READY && outstandingStateRequest !== null) {
+      socket!.send(outstandingStateRequest);
+    }
+  }
+
   /** The event's own name, or null for frames we cannot read. */
   function eventIdOf (item: unknown): string | null {
     if (typeof item !== 'string') return null;
@@ -403,6 +436,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         const { status, ...user } = response;
         storage.set(user);
         util.dispatchCustomEvent('auth', { detail: user });
+        // Auth lands once per connection and is what the server needs before it
+        // can route a state request, so this is the moment to (re-)ask if we
+        // are still waiting for one.
+        sendStateRequest();
         break;
       }
       // These should probably be behind a feature flag, as they assume
@@ -414,6 +451,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         util.dispatchCustomEvent(response.event_type, { detail: response.detail });
         break;
       case 'fetch_blob':
+        outstandingStateRequest = null;   // answered; stop re-asking
         util.dispatchCustomEvent('fetch_blob', { detail: response.data });
         break;
       case 'save_blob_ack':
@@ -446,6 +484,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // by throwing: sendEvent (loEvent) re-throws non-BlockError out of its
     // fan-out over a DESTRUCTIVE front-desk queue, which would skip sibling
     // loggers and lose the event for them — violating "every event delivered".
+    if (isStateRequest(data)) {
+      // Connection-scoped: remembered, sent now, re-sent on reconnect —
+      // never persisted. See outstandingStateRequest above.
+      outstandingStateRequest = data;
+      sendStateRequest();
+      return;
+    }
     queue.enqueue(data);
   }
 
