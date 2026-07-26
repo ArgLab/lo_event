@@ -132,27 +132,77 @@ export async function unackedCount (): Promise<number> {
 }
 
 /**
- * DEBUG handles for the durable queues, for use from a browser console.
+ * Console debugging for the durable queue.
  *
- *   const q = lo_event.queueDebug()[0];
- *   await q.count();          // how many events are waiting
- *   await q.inspect();        // WHAT is waiting — the first 20 records
- *   q.clear();                // drop everything, unsent included
+ * Attached to `globalThis.loDebug` in browsers, because the useful moment for
+ * this is a console prompt in a stuck tab, where there is no module to import:
  *
- * `inspect` earns its place: a queue that only grows looks identical whether
- * the client is offline, the server is refusing to ack, or a frame was
- * enqueued that can never BE acked. Reading the stuck records distinguishes
- * them in seconds.
+ *   loDebug.queue()        what is waiting, and WHY it is waiting
+ *   loDebug.clearQueue()   drop everything, unsent included
  *
- * `clear` is destructive and meant to be: it exists for recovering a queue
- * holding junk a broken build left behind, which would otherwise be resent on
- * every reconnect forever. It discards unsent events — never call it on a
- * queue you believe holds real work.
+ * `queue()` summarizes rather than dumping records. A queue that only grows
+ * looks identical whether the client is offline, the server is not acking, or
+ * a frame was enqueued that can never BE acked — and the last one is invisible
+ * in a raw dump unless you happen to notice a missing field. So it counts the
+ * unnamed records explicitly and breaks the rest down by event type, which is
+ * what turns "there are a ton of save_blobs" into a diagnosis.
  */
-export function queueDebug (): QueueDebug[] {
-  return loggersEnabled
-    .filter(logger => logger.queueDebug)
-    .map(logger => logger.queueDebug!);
+async function queueReport (limit = 50): Promise<Record<string, unknown>[]> {
+  const handles = loggersEnabled.filter(l => l.queueDebug).map(l => l.queueDebug!);
+  if (!handles.length) {
+    console.log('loDebug: no ack-aware logger with a durable queue.');
+    return [];
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  let total = 0;
+  let unnamed = 0;
+  const byType: Record<string, number> = {};
+
+  for (const h of handles) {
+    total += await h.count();
+    for (const rec of await h.inspect(limit)) {
+      // Records are stored as { seq, payload } (memory) or the raw stored
+      // object (IDB); the payload is the serialized frame either way.
+      const r = rec as Record<string, unknown>;
+      const raw = (r.payload ?? r) as unknown;
+      let frame: Record<string, any> = {};
+      try { frame = typeof raw === 'string' ? JSON.parse(raw) : (raw as any) ?? {}; }
+      catch { /* unparseable — reported as unknown below */ }
+
+      const type = frame.event ?? frame.type ?? '(unknown)';
+      const id = frame?.metadata?.eventId;
+      byType[type] = (byType[type] ?? 0) + 1;
+      if (!id) unnamed++;
+      rows.push({ seq: r.seq, event: type, eventId: id ?? '— UNNAMED —', bytes: JSON.stringify(frame).length });
+    }
+  }
+
+  console.log(`loDebug: ${total} record(s) waiting; showing up to ${limit}.`);
+  console.table(byType);
+  if (unnamed) {
+    console.warn(
+      `loDebug: ${unnamed} record(s) have no metadata.eventId. The server acks ` +
+      'by name, so these can never be acked — they are sent best-effort and ' +
+      'dropped. If they keep appearing, an enqueue path is not stamping.'
+    );
+  }
+  console.table(rows);
+  return rows;
+}
+
+function clearQueues (): void {
+  const handles = loggersEnabled.filter(l => l.queueDebug).map(l => l.queueDebug!);
+  handles.forEach(h => h.clear());
+  console.warn(`loDebug: cleared ${handles.length} queue(s) — unsent events discarded.`);
+}
+
+export const loDebug = { queue: queueReport, clearQueue: clearQueues };
+
+// Attach for console use. Debug-only affordance, browser-only, and it never
+// overwrites something already there.
+if (typeof globalThis !== 'undefined' && !(globalThis as any).loDebug) {
+  (globalThis as any).loDebug = loDebug;
 }
 
 // TODO: We should consider specifying a set of verbs, nouns, etc. we

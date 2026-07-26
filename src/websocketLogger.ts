@@ -205,18 +205,39 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // untouched; the server acks the name the event already carries.
       const id = eventIdOf(item);
       if (id === null) {
-        // Unnameable frame: the server cannot ack what it cannot name, so this
-        // record would never be confirmed, never deleted, and resent on every
-        // reconnect. Loud, because the symptom (a queue that grows forever) is
-        // otherwise indistinguishable from being offline.
+        // UNNAMED RECORD — legacy best-effort, then drop it.
+        //
+        // The server acks by name, so a record without one can never be
+        // confirmed: it would sit in the durable queue forever and be resent on
+        // every reconnect. That is not hypothetical — every record enqueued by
+        // a pre-identity build is unnamed, and they are already sitting in real
+        // IndexedDB queues.
+        //
+        // Send-and-confirm is the honest handling: these were written by a
+        // client that never promised durable tracking (its transport tagged
+        // whatever it happened to send), so delete-on-send is exactly the
+        // guarantee they were created under. Holding them for an ack that
+        // cannot arrive trades a real leak for a promise nobody made.
+        //
+        // Post-transition, an unnamed frame means a new enqueue path forgot to
+        // stamp — hence the log. Draining beats leaking either way.
         debug.error(
-          'WEBSOCKET: frame has no metadata.eventId; it can never be acked or ' +
-          'deleted. Every enqueued frame must be stamped (see enqueueOwnFrame).',
+          'WEBSOCKET: frame has no metadata.eventId — sent best-effort and ' +
+          'dropped, since an unnamed record can never be acked. Legacy queue ' +
+          'contents are expected here; anything else is an unstamped enqueue ' +
+          'path (see enqueueOwnFrame).',
           item
         );
-      } else {
-        inFlight.set(id, seq);
+        socket!.send(item as string);
+        queue.confirm([seq]);
+        return;
       }
+      // NOTE: an entry can linger if another tab ends up delivering this record
+      // (the planned stale-drain). Harmless — storage ids are never reused, so
+      // a stale entry cannot cause a wrong delete. Do NOT "fix" this by
+      // resetting per connection: identities outlive connections, which is the
+      // whole point of acking by name.
+      inFlight.set(id, seq);
       socket!.send(item as string);
     } else {
       socket!.send(item as string);

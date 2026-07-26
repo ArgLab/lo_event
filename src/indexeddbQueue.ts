@@ -266,8 +266,13 @@ export class Queue {
 
     for (const id of seqs) {
       const request = objectStore.delete(id);
-      request.onerror = () => {
+      request.onerror = (ev) => {
         debug.error('IDBQUEUE ERROR: Error confirming (deleting) item:', request.error);
+        // An unhandled IDB request error ABORTS the transaction, rolling back
+        // the sibling deletes that already succeeded — turning one bad id into
+        // "none of this batch was confirmed", and those records get resent.
+        // Deleting a missing key succeeds in IDB, so this is defensive.
+        ev.preventDefault();
       };
     }
 

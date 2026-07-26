@@ -148,6 +148,10 @@ export function timestampEvent (event: Record<string, unknown>): void {
   metadata.browserTag = browserStamp();
   metadata.sessionTag = sessionStamp;
   metadata.sessionSeq = seq;
+  // OPAQUE: joined with "." purely for legibility. The parts are themselves
+  // uuid-timestamp strings containing "-" (and could gain more), so this is
+  // NOT a parseable encoding — compare it and grep it, never split it apart.
+  // The components are alongside for anything that needs them structurally.
   metadata.eventId = `${metadata.browserTag as string}.${sessionStamp}.${seq}`;
 
   if(verboseEvents) {
