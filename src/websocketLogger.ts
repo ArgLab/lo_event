@@ -198,15 +198,42 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // is still outstanding. Re-asking is free (the request is idempotent) and it
   // makes reconnect self-healing instead of terminal.
   const STATE_REQUEST = 'fetch_blob';
+  // SINGLE OUTSTANDING REQUEST. Only one state snapshot is ever in flight —
+  // today only ReduxStoreLoader asks, once. A second distinct request before
+  // the first is answered would silently replace this slot; if per-document
+  // fetches ever arrive, this becomes a map keyed by what is being requested.
   let outstandingStateRequest: string | null = null;
+
+  // SNAPSHOT AFTER FLUSH. The request must reach the server AFTER the recovered
+  // backlog, or the snapshot predates the client's own last keystrokes: the
+  // server folds the tail afterwards but never echoes it back (no-echo), so the
+  // UI would show stale state until another reload — losing exactly the tail
+  // that durable recovery just saved.
+  //
+  // Ordering is by ARRIVAL on the connection (the server folds serially), so
+  // the backlog need only be SENT first, not acked. Gating on "queue empty"
+  // instead would starve on a busy client, which never empties.
+  //
+  // The backlog is whatever was already stored when this connection
+  // authenticated. Leases hand out records in ascending storage id and new
+  // events get higher ids, so the first `backlogAtAuth` records sent on this
+  // connection ARE the backlog — a plain count is enough, and it is bounded, so
+  // ongoing typing cannot defer the snapshot forever.
+  let backlogAtAuth = 0;
+  let sentThisConn = 0;
 
   function isStateRequest (item: unknown): boolean {
     if (typeof item !== 'string') return false;
+    // Substring pre-filter first: this runs on EVERY outgoing event, and
+    // sendLeased parses again for the id — a double JSON.parse per event is
+    // real cost when payloads carry a whole parsed idMap. The parse below only
+    // runs for the handful of frames that could actually be a state request.
+    if (!item.includes('"' + STATE_REQUEST + '"')) return false;
     try { return JSON.parse(item)?.event === STATE_REQUEST; } catch { return false; }
   }
 
   function sendStateRequest () {
-    if (READY && outstandingStateRequest !== null) {
+    if (READY && outstandingStateRequest !== null && sentThisConn >= backlogAtAuth) {
       socket!.send(outstandingStateRequest);
     }
   }
@@ -263,6 +290,8 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         );
         socket!.send(item as string);
         queue.confirm([seq]);
+        sentThisConn++;
+        if (outstandingStateRequest !== null) sendStateRequest();
         return;
       }
       // NOTE: an entry can linger if another tab ends up delivering this record
@@ -272,6 +301,9 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // whole point of acking by name.
       inFlight.set(id, seq);
       socket!.send(item as string);
+      sentThisConn++;
+      // The backlog may have just finished going out.
+      if (outstandingStateRequest !== null) sendStateRequest();
     } else {
       socket!.send(item as string);
       queue.confirm([seq]);
@@ -436,10 +468,15 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         const { status, ...user } = response;
         storage.set(user);
         util.dispatchCustomEvent('auth', { detail: user });
-        // Auth lands once per connection and is what the server needs before it
-        // can route a state request, so this is the moment to (re-)ask if we
-        // are still waiting for one.
-        sendStateRequest();
+        // Auth lands once per connection and is what the server needs before
+        // it can route a state request, so this is the moment to (re-)ask if we
+        // are still waiting for one — but only once this connection has pushed
+        // the backlog that was already waiting. See "snapshot after flush".
+        void Promise.resolve(queue.unconfirmedCount()).then((n) => {
+          backlogAtAuth = n;
+          sentThisConn = 0;
+          sendStateRequest();
+        });
         break;
       }
       // These should probably be behind a feature flag, as they assume

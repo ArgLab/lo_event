@@ -182,7 +182,8 @@ async function queueReport (limit = 50): Promise<Record<string, unknown>[]> {
   console.table(byType);
   if (unnamed) {
     console.warn(
-      `loDebug: ${unnamed} record(s) have no metadata.eventId. The server acks ` +
+      `loDebug: ${unnamed} of the first ${limit} record(s) inspected have no ` +
+      'metadata.eventId (the total above may hold more). The server acks ' +
       'by name, so these can never be acked — they are sent best-effort and ' +
       'dropped. If they keep appearing, an enqueue path is not stamping.'
     );
