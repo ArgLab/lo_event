@@ -48,9 +48,10 @@ export class Queue {
     this.queue.enqueue(item);
   }
 
-  /** Cumulative ack: delete every leased item with seq <= uptoSeq. */
-  confirm (uptoSeq: number) {
-    this.queue.confirm(uptoSeq);
+  /** Delete exactly the listed seqs — the ones THIS connection sent and saw
+   *  acked. Never a range: the store is shared across tabs. */
+  confirm (seqs: number[]) {
+    this.queue.confirm(seqs);
   }
 
   /** Reset the lease cursor so unconfirmed items are re-handed (resend). */

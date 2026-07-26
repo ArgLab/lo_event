@@ -85,8 +85,15 @@ export interface QueueBackend {
   /** Next un-leased stored item (lowest seq), WITHOUT deleting it. Parks
    *  until an item is available. Advances an in-memory lease cursor. */
   leaseNext(): Promise<LeasedItem>;
-  /** Delete every stored item with seq <= uptoSeq (cumulative ack). */
-  confirm(uptoSeq: number): void;
+  /** Delete EXACTLY the listed stored seqs.
+   *
+   *  Deliberately not a range delete. The store is shared by every tab in the
+   *  browser (that is what gives tab-close recovery), while each tab acks over
+   *  its OWN socket. A cumulative range delete therefore let one tab's ack
+   *  delete another tab's records — including records that had been enqueued
+   *  but never sent by anyone, which is data loss, not a duplicate. A caller
+   *  passes only the seqs it sent and saw acked on its own connection. */
+  confirm(seqs: number[]): void;
   /** Reset the lease cursor so leaseNext() re-hands all unconfirmed items
    *  from the lowest stored seq (used on reconnect to resend). */
   rewind(): void;

@@ -34,7 +34,7 @@ const COUNT = 'count';
 interface DBOperation {
   operation: string;
   payload?: { payload: unknown };
-  uptoSeq?: number;
+  seqs?: number[];
   resolve?: (value: unknown) => void;
   reject?: (reason?: unknown) => void;
 }
@@ -243,19 +243,33 @@ export class Queue {
   }
 
   /**
-   * Cumulative ack: delete every stored record with id <= uptoSeq. A single
-   * ranged delete covers the whole confirmed prefix in one transaction.
+   * Delete EXACTLY the listed ids, in one transaction.
+   *
+   * NOT a ranged delete. This store is shared by every tab in the browser —
+   * that sharing is what makes tab-close recovery work — but each tab acks
+   * over its own socket. `delete(upperBound(seq))` therefore deleted records
+   * belonging to other tabs, including ones nobody had sent yet. Duplicates
+   * are covered by at-least-once delivery; deletions never were.
    */
   async confirmInDB (op: DBOperation) {
+    const seqs = op.seqs ?? [];
+    if (!seqs.length) { op.resolve?.(undefined); return; }
     const transaction = this.db!.transaction([this.queueName], 'readwrite');
     const objectStore = transaction.objectStore(this.queueName);
-    const request = objectStore.delete(IDBKeyRange.upperBound(op.uptoSeq!));
+    let pending = seqs.length;
+    let failed: unknown = null;
 
-    request.onsuccess = () => { op.resolve?.(undefined); };
-    request.onerror = () => {
-      debug.error('IDBQUEUE ERROR: Error confirming (deleting) items:', request.error);
-      op.reject?.(request.error);
-    };
+    for (const id of seqs) {
+      const request = objectStore.delete(id);
+      request.onsuccess = () => {
+        if (--pending === 0 && !failed) op.resolve?.(undefined);
+      };
+      request.onerror = () => {
+        failed = request.error;
+        debug.error('IDBQUEUE ERROR: Error confirming (deleting) item:', request.error);
+        if (--pending === 0) op.reject?.(failed);
+      };
+    }
   }
 
   /** Count stored (unconfirmed) records. */
@@ -352,9 +366,10 @@ export class Queue {
     });
   }
 
-  /** Cumulative ack — delete everything with seq <= uptoSeq. Fire-and-forget. */
-  confirm (uptoSeq: number) {
-    this.addItemToDBOperationQueue({ operation: CONFIRM, uptoSeq });
+  /** Delete exactly these stored ids. Fire-and-forget. */
+  confirm (seqs: number[]) {
+    if (!seqs.length) return;
+    this.addItemToDBOperationQueue({ operation: CONFIRM, seqs });
   }
 
   /**

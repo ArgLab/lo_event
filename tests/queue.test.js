@@ -52,7 +52,7 @@ describe('Queue', () => {
 // Ack-protocol backbone: lease is non-destructive; confirm deletes the
 // acked prefix; rewind re-hands unconfirmed items (resend on reconnect).
 describe('MemoryQueue lease / confirm / rewind', () => {
-  it('leases with seq WITHOUT deleting; confirm deletes cumulatively', async () => {
+  it('leases with seq WITHOUT deleting; confirm deletes exactly what it is given', async () => {
     const q = new MemoryQueue('lease-confirm');
     q.enqueue('a'); q.enqueue('b'); q.enqueue('c');
 
@@ -60,7 +60,7 @@ describe('MemoryQueue lease / confirm / rewind', () => {
     expect(await q.leaseNext()).toEqual({ seq: 2, item: 'b' });
     expect(q.unconfirmedCount()).toBe(3);   // leased, but nothing deleted
 
-    q.confirm(2);                            // ack "everything through #2"
+    q.confirm([1, 2]);                       // the two records this sender sent
     expect(q.unconfirmedCount()).toBe(1);    // only 'c' remains
     expect(await q.leaseNext()).toEqual({ seq: 3, item: 'c' });
   });
@@ -81,7 +81,7 @@ describe('MemoryQueue lease / confirm / rewind', () => {
     q.enqueue('a'); q.enqueue('b'); q.enqueue('c');
     await q.leaseNext(); await q.leaseNext(); await q.leaseNext();
 
-    q.confirm(1);      // 'a' durably acked
+    q.confirm([1]);    // 'a' durably acked
     q.rewind();        // reconnect
 
     expect(await q.leaseNext()).toEqual({ seq: 2, item: 'b' });
@@ -130,7 +130,51 @@ describe('Queue lease loop', () => {
     expect(received).toEqual([{ seq: 1, item: 'x' }, { seq: 2, item: 'y' }]);
     expect(await q.unconfirmedCount()).toBe(2);  // held pending ack
 
-    q.confirm(2);
+    q.confirm([1, 2]);
     expect(await q.unconfirmedCount()).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The shared-store, multi-sender hazard
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// One IndexedDB queue is shared by every tab in the browser — that sharing is
+// exactly what makes tab-close recovery work. But each tab acks over its OWN
+// socket. When deletion was a cumulative range (`delete(id <= n)`), one tab's
+// ack deleted records belonging to other tabs, including records nobody had
+// sent yet. Duplicates are covered by at-least-once delivery; deletions are
+// not — that is silent data loss.
+//
+// The rule these lock in: a sender may delete ONLY the records it sent and saw
+// acked on its own connection.
+
+describe('shared store, independent senders', () => {
+  it('one sender\'s ack does not delete another sender\'s unsent records', async () => {
+    const q = new MemoryQueue('two-tabs');
+    // Interleaved, as two tabs writing to one store would be.
+    q.enqueue('A1'); q.enqueue('B1'); q.enqueue('A2'); q.enqueue('B2');
+
+    // Tab A sent only its own two records (seqs 1 and 3) and got them acked.
+    q.confirm([1, 3]);
+
+    // Tab B's records must still be there. Under the old cumulative delete,
+    // confirming "through 3" would have taken B1 with it — unsent and gone.
+    expect(q.unconfirmedCount()).toBe(2);
+    q.rewind();
+    expect(await q.leaseNext()).toEqual({ seq: 2, item: 'B1' });
+    expect(await q.leaseNext()).toEqual({ seq: 4, item: 'B2' });
+  });
+
+  it('a sender that dies before its ack loses nothing', async () => {
+    const q = new MemoryQueue('dead-tab');
+    q.enqueue('x'); q.enqueue('y');
+    await q.leaseNext(); await q.leaseNext();   // sent, never acked
+
+    // The tab dies: its sent-map dies with it, so nothing is confirmed.
+    q.rewind();                                  // next connection
+
+    expect(q.unconfirmedCount()).toBe(2);
+    expect(await q.leaseNext()).toEqual({ seq: 1, item: 'x' });
   });
 });

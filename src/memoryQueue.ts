@@ -84,8 +84,10 @@ export class Queue {
     });
   }
 
-  confirm (uptoSeq: number) {
-    this.items = this.items.filter(e => e.seq > uptoSeq);
+  confirm (seqs: number[]) {
+    if (!seqs.length) return;
+    const drop = new Set(seqs);
+    this.items = this.items.filter(e => !drop.has(e.seq));
   }
 
   rewind () {

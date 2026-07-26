@@ -154,7 +154,45 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // accumulate in the durable queue rather than going out un-acked and lost.
   }
 
-  // Tag an outgoing event with its durable seq so the server can ack it.
+  // THREE NUMBERS, THREE SCOPES — do not collapse them again.
+  //
+  //   1. storage id   — the queue's own key. Scope: this browser's shared
+  //                     store. Orders and leases. NEVER goes on the wire: it
+  //                     is meaningless outside that database.
+  //   2. wire seq     — `wireSeq` below. Scope: ONE connection, restarting at
+  //                     1 each time. This is what the server acks.
+  //   3. identity     — [browser].[tab].[seq] (browserTag / sessionTag /
+  //                     sessionIndex, already stamped on every event). Scope:
+  //                     forever. For dedup, analytics, forensics. Never used
+  //                     for acks or deletes.
+  //
+  // Collapsing 1 and 2 was the bug: cumulative acking is only sound when the
+  // acknowledged sequence belongs to exactly one connection, and the storage
+  // id is shared by every tab. A per-connection counter is owned by one
+  // connection BY CONSTRUCTION, so there is nothing to coordinate.
+  //
+  // `sentThisConn` maps wire seq -> storage id for what this socket has sent
+  // and not yet had acked. It is the precise answer to "what may I delete?",
+  // and it is discarded on disconnect: unacked records simply stay in the
+  // store and are re-sent (under fresh wire seqs) after rewind().
+  let wireSeq = 0;
+  const sentThisConn = new Map<number, number>();
+
+  function resetConnectionSeq () {
+    wireSeq = 0;
+    sentThisConn.clear();
+  }
+
+  /** Storage ids this connection sent with wire seq <= n (cumulative ack). */
+  function drainAcked (n: number): number[] {
+    const ids: number[] = [];
+    for (const [w, storageId] of sentThisConn) {
+      if (w <= n) { ids.push(storageId); sentThisConn.delete(w); }
+    }
+    return ids;
+  }
+
+  // Tag an outgoing event with its wire seq so the server can ack it.
   // Only used in ack mode; leaves non-JSON frames untouched.
   //
   // `seq` is a RESERVED transport field (top-level, per the wire contract the
@@ -186,10 +224,13 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     // mode, confirm(delete) an event that never went out.
     if (!READY) return;
     if (ackMode) {
-      socket!.send(tagSeq(item, seq));
+      // `seq` is the STORAGE id; the wire carries this connection's own counter.
+      const w = ++wireSeq;
+      sentThisConn.set(w, seq);
+      socket!.send(tagSeq(item, w));
     } else {
       socket!.send(item as string);
-      queue.confirm(seq);
+      queue.confirm([seq]);
     }
   }
 
@@ -207,6 +248,10 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         await util.delay(calculateExponentialBackoff(failures));
       } else {
         READY = true;
+        // New connection: the wire seq restarts at 1 and nothing is in flight.
+        // Anything the previous socket sent but never had acked is still in the
+        // store (we only ever delete on ack), so rewind() re-hands it below.
+        resetConnectionSeq();
         failures = 0;
         util.dispatchCustomEvent('lo_connection_status', { detail: { connected: true } });
         // Resolve this connection's capability mode, THEN resend. hello opens the
@@ -308,7 +353,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       case 'ack':
         // Cumulative: the server durably wrote everything through response.seq.
         if (typeof response.seq === 'number') {
-          queue.confirm(response.seq);
+          queue.confirm(drainAcked(response.seq));
         }
         break;
       case 'blocklist':
