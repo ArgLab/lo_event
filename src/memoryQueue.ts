@@ -120,4 +120,14 @@ export class Queue {
   unconfirmedCount (): number {
     return this.items.length;
   }
+
+  /** Highest stored seq (items are kept in ascending seq), or null if empty. */
+  async maxSeq (): Promise<number | null> {
+    return this.items.length ? this.items[this.items.length - 1].seq : null;
+  }
+
+  /** Stored records at or below `seq` that this instance has not leased. */
+  async unleasedAtOrBelow (seq: number): Promise<number> {
+    return this.items.filter(e => e.seq > this.leasedThrough && e.seq <= seq).length;
+  }
 }

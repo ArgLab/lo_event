@@ -64,6 +64,18 @@ export class Queue {
     return this.queue.unconfirmedCount();
   }
 
+  /** Highest stored seq, or null when empty — the snapshot barrier watermark,
+   *  captured once per connection after rewind. */
+  maxSeq (): Promise<number | null> {
+    return this.queue.maxSeq();
+  }
+
+  /** Stored records at or below `seq` that this instance has not yet leased.
+   *  Zero means the flush barrier is clear (see QueueBackend in types.ts). */
+  unleasedAtOrBelow (seq: number): Promise<number> {
+    return this.queue.unleasedAtOrBelow(seq);
+  }
+
   /** DEBUG: peek at what is sitting in the queue. */
   inspect (limit = 20): Promise<unknown[]> {
     return this.queue.inspect(limit);

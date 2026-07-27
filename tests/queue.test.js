@@ -178,3 +178,79 @@ describe('shared store, independent senders', () => {
     expect(await q.leaseNext()).toEqual({ seq: 1, item: 'x' });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The flush barrier (snapshot-after-flush)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Before requesting a state snapshot, a connection must know its backlog has
+// reached the server. The barrier is a question about the SHARED store, so it
+// is asked of the store: capture the highest stored seq at connection start
+// (maxSeq — the watermark), then probe unleasedAtOrBelow(watermark) until it
+// reaches zero. Counting sends instead was wrong twice: on a shared store,
+// another tab can send-and-delete records this connection was measured
+// against, so no captured count is a quota this connection can be relied on
+// to meet.
+
+describe('flush barrier (maxSeq / unleasedAtOrBelow)', () => {
+  it('maxSeq is null on an empty store, and the watermark otherwise', async () => {
+    const q = new MemoryQueue('barrier-empty');
+    expect(await q.maxSeq()).toBe(null);
+    q.enqueue('a'); q.enqueue('b');
+    expect(await q.maxSeq()).toBe(2);
+  });
+
+  it('clears as this connection leases (sends) the backlog', async () => {
+    const q = new MemoryQueue('barrier-drain');
+    q.enqueue('a'); q.enqueue('b'); q.enqueue('c');
+    const w = await q.maxSeq();
+
+    expect(await q.unleasedAtOrBelow(w)).toBe(3);
+    await q.leaseNext();
+    await q.leaseNext();
+    expect(await q.unleasedAtOrBelow(w)).toBe(1);
+    await q.leaseNext();
+    expect(await q.unleasedAtOrBelow(w)).toBe(0);   // barrier clear
+  });
+
+  it('ignores records enqueued after the watermark (live typing cannot starve it)', async () => {
+    const q = new MemoryQueue('barrier-live');
+    q.enqueue('backlog');
+    const w = await q.maxSeq();
+    q.enqueue('keystroke-1'); q.enqueue('keystroke-2');
+
+    await q.leaseNext();                             // the one backlog record
+    expect(await q.unleasedAtOrBelow(w)).toBe(0);    // clear despite new events
+  });
+
+  it("clears when ANOTHER tab drains records this connection never leases", async () => {
+    // Sol's starvation case, the one no send count can handle: the store is
+    // shared, so another tab can send a backlog record and delete it on ack
+    // before this connection reaches it. A connection waiting to observe N of
+    // its own sends waits forever; asking the store instead sees the records
+    // gone — and gone-by-ack means the server already has them, which is
+    // exactly what the barrier wants to know.
+    const q = new MemoryQueue('barrier-cross-tab');
+    q.enqueue('a'); q.enqueue('b'); q.enqueue('c');
+    const w = await q.maxSeq();
+
+    await q.leaseNext();          // this connection sends 'a'...
+    q.confirm([2, 3]);            // ...another tab sent and acked 'b' and 'c'
+
+    expect(await q.unleasedAtOrBelow(w)).toBe(0);   // barrier clear, no starvation
+  });
+
+  it('a rewound cursor makes the backlog pending again (measure AFTER rewind)', async () => {
+    // unleasedAtOrBelow measures against the lease cursor, so the watermark
+    // must be captured after rewind(): before it, the cursor still holds the
+    // previous connection's position and the backlog looks already-sent.
+    const q = new MemoryQueue('barrier-rewind');
+    q.enqueue('a'); q.enqueue('b');
+    await q.leaseNext(); await q.leaseNext();        // previous connection sent both
+    const w = await q.maxSeq();
+
+    expect(await q.unleasedAtOrBelow(w)).toBe(0);    // stale cursor: looks clear
+    q.rewind();                                      // new connection resends
+    expect(await q.unleasedAtOrBelow(w)).toBe(2);    // truth: both pending again
+  });
+});

@@ -214,10 +214,115 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
     try { return JSON.parse(item)?.event === STATE_REQUEST; } catch { return false; }
   }
 
-  /** One record left this connection; the backlog may have just finished. */
-  function countSend () {
-    stateRequest.sentRecord();
-    sendStateRequest();
+  // THE FLUSH BARRIER, asked of the queue rather than counted here.
+  //
+  // Two count-based designs preceded this and both were structurally wrong on
+  // a shared store (see stateRequest.ts for the full history): a captured
+  // count is not a per-connection quota, because another tab can send-and-
+  // delete shared records this connection was being measured against — it
+  // then never observes that many sends and the barrier starves. Only the
+  // queue knows what remains, so the barrier is: capture the highest stored
+  // seq at connection start (after rewind — the lease cursor is part of the
+  // question), then ask `unleasedAtOrBelow(watermark)` until it reaches zero.
+  // Records below the watermark that vanish un-leased were deleted by an ack,
+  // meaning the server already has them — the barrier clears correctly
+  // without this connection ever seeing them.
+  //
+  // Re-checks are event-driven (each send nudges), with a slow fallback timer
+  // for the case with no local events at all: an idle page whose backlog is
+  // drained entirely by another tab. Cross-tab deletions emit no signal here,
+  // so without the timer that page would never notice the barrier cleared.
+  // The timer runs until the barrier clears (bounded — the backlog drains),
+  // whether or not a request is waiting yet: the request can arrive later
+  // than the connection, and must find the barrier already being evaluated.
+  const BARRIER_RECHECK_MS = 300;
+  let barrierWatermark: number | null = null;   // null = not captured / no backlog
+  let barrierGen = -1;                          // connGen the watermark belongs to
+  let barrierTimer: ReturnType<typeof setInterval> | null = null;
+  let barrierCheckInFlight = false;
+  // True while a leased record is between "cursor advanced" and "socket.send
+  // done". The probe counts by the lease cursor, so in this window a record
+  // looks sent that isn't — a timer probe resolving here could clear the
+  // barrier one record early and let the snapshot jump the last backlog
+  // frame on the wire. The lease loop is strictly serial (queue.ts awaits
+  // onLease), so one flag is coherent; a probe that lands in the window skips,
+  // and the send's own nudge re-probes immediately after.
+  let sendInFlight = false;
+
+  function stopBarrierTimer () {
+    if (barrierTimer !== null) { clearInterval(barrierTimer); barrierTimer = null; }
+  }
+
+  async function checkBarrier (myGen: number, watermark: number) {
+    if (barrierCheckInFlight) return;   // one probe at a time; next nudge retries
+    barrierCheckInFlight = true;
+    try {
+      const pending = await queue.unleasedAtOrBelow(watermark);
+      if (myGen !== connGen) return;    // stale connection — its barrier is moot
+      if (sendInFlight) return;         // mid-send window: the nudge after it re-probes
+      if (pending === 0) {
+        stopBarrierTimer();
+        stateRequest.barrierCleared();
+        sendStateRequest();
+      }
+    } catch (err) {
+      // An unreadable store must not strand the snapshot forever: fall back
+      // to no barrier, which is the pre-barrier behavior.
+      debug.error('WEBSOCKET: could not probe the flush barrier; asking for state without it', err);
+      if (myGen === connGen) {
+        stopBarrierTimer();
+        stateRequest.barrierCleared();
+        sendStateRequest();
+      }
+    } finally {
+      barrierCheckInFlight = false;
+    }
+  }
+
+  /** Start barrier evaluation for this connection. Called from the gate-then,
+   *  AFTER rewind(): unleasedAtOrBelow measures against the lease cursor, and
+   *  before rewind the cursor still holds the previous connection's position,
+   *  which would make the backlog look already-sent. */
+  function startBarrier (myGen: number) {
+    void Promise.resolve(queue.maxSeq())
+      .then((watermark) => {
+        if (myGen !== connGen) return;
+        if (watermark === null) {
+          // Empty queue at connection start: nothing to flush. The common
+          // page-load case — the snapshot goes out as soon as it is requested.
+          stateRequest.barrierCleared();
+          sendStateRequest();
+          return;
+        }
+        barrierWatermark = watermark;
+        barrierGen = myGen;
+        void checkBarrier(myGen, watermark);
+        stopBarrierTimer();
+        // Runs until the barrier clears — NOT until a request is waiting.
+        // The barrier is a property of the connection, and the request can
+        // arrive later than the connection does (ReduxStoreLoader asks once
+        // auth has landed). Stopping while nothing was outstanding would
+        // leave a late request with no probe to clear it. Bounded either
+        // way: the backlog drains, and the timer stops the moment it does.
+        barrierTimer = setInterval(() => {
+          if (myGen !== connGen || stateRequest.barrierIsClear()) { stopBarrierTimer(); return; }
+          void checkBarrier(myGen, watermark);
+        }, BARRIER_RECHECK_MS);
+      })
+      .catch((err) => {
+        debug.error('WEBSOCKET: could not capture the flush watermark; asking for state without the barrier', err);
+        if (myGen === connGen) {
+          stateRequest.barrierCleared();
+          sendStateRequest();
+        }
+      });
+  }
+
+  /** One record left this connection; the barrier may have just cleared. */
+  function nudgeBarrier () {
+    if (!stateRequest.barrierIsClear() && barrierWatermark !== null && barrierGen === connGen) {
+      void checkBarrier(barrierGen, barrierWatermark);
+    }
   }
 
   function sendStateRequest () {
@@ -239,6 +344,18 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
   // server acks. Legacy: send verbatim and confirm immediately (delete-on-send,
   // exactly today's behavior). Held until the connection's mode is resolved.
   async function sendLeased ({ seq, item }: LeasedItem) {
+    // Set BEFORE the first await: this record's lease cursor has already
+    // advanced, so from here until socket.send completes, a barrier probe
+    // would over-count progress. See sendInFlight above.
+    sendInFlight = true;
+    try {
+      await sendLeasedInner({ seq, item });
+    } finally {
+      sendInFlight = false;
+    }
+  }
+
+  async function sendLeasedInner ({ seq, item }: LeasedItem) {
     await capsGate;
     // The gate is also resolved on disconnect (see the connection loop) to
     // unblock a send parked in the pre-hello window. If the connection is no
@@ -277,7 +394,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         );
         socket!.send(item as string);
         queue.confirm([seq]);
-        countSend();
+        nudgeBarrier();
         return;
       }
       // NOTE: an entry can linger if another tab ends up delivering this record
@@ -287,15 +404,14 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // whole point of acking by name.
       inFlight.set(id, seq);
       socket!.send(item as string);
-      countSend();
+      nudgeBarrier();
     } else {
       socket!.send(item as string);
       queue.confirm([seq]);
-      // Legacy mode counts too. Counting only in ack mode meant the backlog
-      // barrier could never be satisfied here, so the state request was never
-      // sent at all — a permanent "loading" for ack-less deployments, which is
+      // Legacy mode nudges too. Skipping it here once meant the barrier was
+      // never satisfied in ack-less deployments — a permanent "loading" on
       // the path that worked before any of this.
-      countSend();
+      nudgeBarrier();
     }
   }
 
@@ -313,24 +429,11 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         await util.delay(calculateExponentialBackoff(failures));
       } else {
         READY = true;
-        // Per-connection state for the snapshot barrier, captured HERE —
-        // before the capability gate opens and the lease loop can send
-        // anything. Counting from connection start is also self-consistent:
-        // any record an ack deletes mid-drain was necessarily already sent on
-        // this connection, so it is already in the counter.
+        // Snapshot state resets with the connection, BEFORE the capability
+        // gate can open: the barrier starts un-evaluated (refuses to send),
+        // and is captured/probed by startBarrier() after rewind() below.
         stateRequest.connected();
-        void Promise.resolve(queue.unconfirmedCount())
-          .then((n) => {
-            stateRequest.backlogMeasured(n);
-            sendStateRequest();   // backlog may already be empty
-          })
-          .catch((err) => {
-            // An unreadable count must not strand the snapshot forever: fall
-            // back to no barrier, which is the pre-barrier behavior.
-            debug.error('WEBSOCKET: could not measure backlog; asking for state without the barrier', err);
-            stateRequest.backlogMeasured(0);
-            sendStateRequest();
-          });
+        barrierWatermark = null;
         failures = 0;
         util.dispatchCustomEvent('lo_connection_status', { detail: { connected: true } });
         // Resolve this connection's capability mode, THEN resend. hello opens the
@@ -344,11 +447,22 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
         });
         // Resend unconfirmed items only after the mode is known, so nothing is
         // handed to sendLeased (including the rewind-woken parked consumer) while
-        // the mode is still unknown — the race the reviewers caught.
-        gate.then(() => { if (myGen === connGen) queue.rewind(); });
+        // the mode is still unknown — the race the reviewers caught. The flush
+        // barrier starts here too, AFTER rewind: it measures against the lease
+        // cursor, which rewind has just reset — before that, the cursor still
+        // holds the previous connection's position and would make the backlog
+        // look already-sent. (If the gate never opens — requireAck against an
+        // ack-less server — the barrier never evaluates and no snapshot is
+        // requested, consistent with events being held.)
+        gate.then(() => {
+          if (myGen !== connGen) return;
+          queue.rewind();
+          startBarrier(myGen);
+        });
         await socketClosed();
         READY = false;
         stateRequest.disconnected();
+        stopBarrierTimer();
         // Invalidate this connection's generation on close, so a still-pending
         // grace timer (or gate-then) from THIS connection no-ops instead of
         // firing against the NEXT connection's capability state while it's still
@@ -528,6 +642,7 @@ export function websocketLogger (server: string | WsHostOverrides = {}, opts: Ws
       // Connection-scoped: remembered, sent when the backlog is out, re-sent on
       // reconnect — never persisted. See stateRequest.ts.
       stateRequest.request(data);
+      nudgeBarrier();     // the request can arrive after the barrier evaluation started
       sendStateRequest();
       return;
     }

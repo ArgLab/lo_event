@@ -32,12 +32,15 @@ const CONFIRM = 'confirm';
 const COUNT = 'count';
 const INSPECT = 'inspect';
 const CLEAR = 'clear';
+const MAXSEQ = 'maxseq';
+const UNLEASED = 'unleased';
 
 interface DBOperation {
   operation: string;
   payload?: { payload: unknown };
   seqs?: number[];
   limit?: number;
+  atOrBelow?: number;
   resolve?: (value: unknown) => void;
   reject?: (reason?: unknown) => void;
 }
@@ -91,7 +94,9 @@ export class Queue {
       [DEQUEUE]: this.nextItemFromDB,
       [LEASE]: this.leaseFromDB,
       [CONFIRM]: this.confirmInDB,
-      [COUNT]: this.countInDB
+      [COUNT]: this.countInDB,
+      [MAXSEQ]: this.maxSeqInDB.bind(this),
+      [UNLEASED]: this.unleasedInDB.bind(this)
     };
     this.initialize();
   }
@@ -287,6 +292,43 @@ export class Queue {
     transaction.onabort = () => { op.reject?.(transaction.error); };
   }
 
+  /** Highest stored id (the snapshot barrier watermark), or null if empty. */
+  async maxSeqInDB (op: DBOperation) {
+    const transaction = this.db!.transaction([this.queueName], 'readonly');
+    const objectStore = transaction.objectStore(this.queueName);
+    // 'prev' walks from the highest key; the first hit IS the max.
+    const request = objectStore.openCursor(null, 'prev');
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+      op.resolve!(cursor ? (cursor.key as number) : null);
+    };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error reading max seq:', request.error);
+      op.reject!(request.error);
+    };
+  }
+
+  /** Stored records with id in (leasedThrough, atOrBelow] — the ones this
+   *  instance has not yet leased, at or below the barrier watermark. The
+   *  barrier question is asked of the store because only the store knows:
+   *  another tab can send-and-delete records this instance never leases, so
+   *  no send count on our side can answer it. */
+  async unleasedInDB (op: DBOperation) {
+    const atOrBelow = op.atOrBelow!;
+    // Range must be non-empty or IDBKeyRange.bound throws.
+    if (this.leasedThrough >= atOrBelow) { op.resolve!(0); return; }
+    const transaction = this.db!.transaction([this.queueName], 'readonly');
+    const objectStore = transaction.objectStore(this.queueName);
+    const request = objectStore.count(IDBKeyRange.bound(this.leasedThrough, atOrBelow, true, false));
+
+    request.onsuccess = () => { op.resolve!(request.result); };
+    request.onerror = () => {
+      debug.error('IDBQUEUE ERROR: Error counting unleased records:', request.error);
+      op.reject!(request.error);
+    };
+  }
+
   /** Count stored (unconfirmed) records. */
   async countInDB (op: DBOperation) {
     const transaction = this.db!.transaction([this.queueName], 'readonly');
@@ -456,6 +498,29 @@ export class Queue {
     return new Promise<number>((resolve, reject) => {
       this.addItemToDBOperationQueue({
         operation: COUNT,
+        resolve: resolve as (value: unknown) => void,
+        reject
+      });
+    });
+  }
+
+  /** Highest stored id (snapshot barrier watermark), or null if empty. */
+  maxSeq (): Promise<number | null> {
+    return new Promise<number | null>((resolve, reject) => {
+      this.addItemToDBOperationQueue({
+        operation: MAXSEQ,
+        resolve: resolve as (value: unknown) => void,
+        reject
+      });
+    });
+  }
+
+  /** Stored records at or below `seq` this instance has not yet leased. */
+  unleasedAtOrBelow (seq: number): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      this.addItemToDBOperationQueue({
+        operation: UNLEASED,
+        atOrBelow: seq,
         resolve: resolve as (value: unknown) => void,
         reject
       });

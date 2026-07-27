@@ -108,6 +108,18 @@ export interface QueueBackend {
   rewind(): void;
   /** Count of stored (enqueued, not yet confirmed) items. */
   unconfirmedCount(): Promise<number> | number;
+  /** Highest stored seq, or null when the store is empty. Captured once per
+   *  connection (after rewind) as the snapshot barrier's watermark: everything
+   *  at or below it is "the backlog this connection started with". */
+  maxSeq(): Promise<number | null>;
+  /** Stored records with seq at or below `seq` that THIS instance has not yet
+   *  leased (seq > lease cursor). This is the barrier question itself, asked
+   *  of the queue because only the queue knows: on a shared store, another
+   *  tab can send-and-delete records this instance was never going to see, so
+   *  no captured count or send tally can answer it. Zero = barrier clear —
+   *  everything below the watermark was either sent by this connection or
+   *  deleted by an ack (meaning the server already has it). */
+  unleasedAtOrBelow(seq: number): Promise<number>;
   /** DEBUG: the first `limit` stored items, without leasing or deleting.
    *  For answering "what is stuck in there, and why?" from a console. */
   inspect(limit: number): Promise<unknown[]>;

@@ -4,72 +4,59 @@
 // was caught by a human reading the diff, not by a test — which is the reason
 // this logic was pulled out of websocketLogger's socket plumbing in the first
 // place. Each one ends in the same user-visible symptom: "Loading user
-// state..." forever, with no error anywhere.
+// state..." forever (or a stale snapshot), with no error anywhere.
+//
+// The flush barrier itself is NOT here: it is a question about the shared
+// queue's contents, answered by the queue (unleasedAtOrBelow — see the
+// "flush barrier" tests in queue.test.js). This machine only records the
+// answer, and refuses to send until the answer has arrived.
 
 import { describe, it, expect } from 'vitest';
 import { StateRequest } from '../src/stateRequest.js';
 
 const FRAME = JSON.stringify({ event: 'fetch_blob' });
 
-/** Drive a connection that starts with `backlog` records already queued. */
-function connected(sr, backlog = 0) {
-  sr.connected();
-  sr.backlogMeasured(backlog);
-}
-
-describe('snapshot after flush', () => {
-  it('waits for the backlog to be sent before asking', () => {
-    // Asking first means the snapshot predates the client's own last
-    // keystrokes. The server folds them afterwards but never echoes them back,
-    // so the UI shows stale state until another reload — losing exactly the
-    // tail that durable recovery just saved.
-    const sr = new StateRequest();
-    sr.request(FRAME);
-    connected(sr, 3);
-
-    expect(sr.shouldSend()).toBe(false);
-    sr.sentRecord();
-    expect(sr.shouldSend()).toBe(false);
-    sr.sentRecord();
-    sr.sentRecord();
-    expect(sr.shouldSend()).toBe(true);
-  });
-
-  it('asks immediately when there is no backlog', () => {
-    const sr = new StateRequest();
-    sr.request(FRAME);
-    connected(sr, 0);
-    expect(sr.shouldSend()).toBe(true);
-  });
-
-  it('counts sends made before the backlog count resolves', () => {
-    // The capability gate opens at hello, so the lease loop can push records
-    // before the count comes back. Those sends must still count: zeroing the
-    // counter when the measurement landed left a deficit that nothing could
-    // close on a page generating no new events.
+describe('barrier discipline', () => {
+  it('refuses to send while the barrier is un-evaluated — not-yet-measured is not zero', () => {
+    // A zero-initialized barrier is an answer, not a placeholder: any check
+    // that ran before the backlog measurement resolved saw a satisfied
+    // barrier, and the request overtook the backlog — the snapshot predated
+    // the client's own last keystrokes.
     const sr = new StateRequest();
     sr.request(FRAME);
     sr.connected();
-    sr.sentRecord();
-    sr.sentRecord();
-    sr.backlogMeasured(2);       // measurement arrives late
+
+    expect(sr.shouldSend()).toBe(false);   // barrier not yet evaluated
+    sr.barrierCleared();
+    expect(sr.shouldSend()).toBe(true);
+  });
+
+  it('a reconnect re-arms the barrier — clearance is per-connection', () => {
+    const sr = new StateRequest();
+    sr.request(FRAME);
+    sr.connected();
+    sr.barrierCleared();
+
+    sr.disconnected();
+    sr.connected();
+    expect(sr.shouldSend()).toBe(false);   // new connection, new backlog
+    sr.barrierCleared();
     expect(sr.shouldSend()).toBe(true);
   });
 });
 
 describe('ask once per connection', () => {
-  it('does not re-ask after every subsequent record', () => {
+  it('does not re-ask after the first send', () => {
     // shouldSend() is consulted after every drained record. Without a latch,
-    // each record past the threshold fires another request and the server
-    // builds a full state blob for each — a self-inflicted burst.
+    // each record past the barrier fired another request and the server built
+    // a full state blob for each — a self-inflicted burst.
     const sr = new StateRequest();
     sr.request(FRAME);
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
 
     expect(sr.shouldSend()).toBe(true);
-    sr.sentRecord();
     expect(sr.shouldSend()).toBe(false);
-    sr.sentRecord();
     expect(sr.shouldSend()).toBe(false);
   });
 
@@ -78,25 +65,44 @@ describe('ask once per connection', () => {
     // latch clears with the connection, the request survives until answered.
     const sr = new StateRequest();
     sr.request(FRAME);
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
     expect(sr.shouldSend()).toBe(true);
 
     sr.disconnected();
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
     expect(sr.shouldSend()).toBe(true);
   });
 
   it('stops asking once answered, across reconnects', () => {
     const sr = new StateRequest();
     sr.request(FRAME);
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
     sr.shouldSend();
     sr.fulfilled();
 
     sr.disconnected();
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
     expect(sr.shouldSend()).toBe(false);
     expect(sr.frame()).toBe(null);
+  });
+
+  it('a NEW request re-arms the latch on the same connection', () => {
+    // request() is a new question, even after a previous one was asked and
+    // answered on this connection. Without re-arming, a second request would
+    // silently wait for a reconnect that may never come.
+    const sr = new StateRequest();
+    sr.request(FRAME);
+    sr.connected();
+    sr.barrierCleared();
+    sr.shouldSend();
+    sr.fulfilled();
+
+    sr.request(FRAME);
+    expect(sr.shouldSend()).toBe(true);
   });
 });
 
@@ -109,23 +115,27 @@ describe('preconditions', () => {
 
   it('never asks when nothing was requested', () => {
     const sr = new StateRequest();
-    connected(sr, 0);
+    sr.connected();
+    sr.barrierCleared();
     expect(sr.shouldSend()).toBe(false);
   });
+});
 
-  it('a fresh connection re-arms the barrier for its own backlog', () => {
-    // Backlog is per-connection: a reconnect facing a new backlog must wait
-    // again rather than inheriting the previous connection's progress.
+describe('barrierIsClear() — the evaluator stop condition', () => {
+  it('reflects clearance per connection, independent of any request', () => {
+    // The probe loop (nudges + fallback timer) keys off this: the barrier is
+    // a property of the CONNECTION, so it must keep being evaluated even when
+    // no request is waiting yet — the request can arrive after the backlog
+    // has drained, and must find the barrier already clear rather than
+    // waiting for a probe that nothing will ever trigger.
     const sr = new StateRequest();
-    sr.request(FRAME);
-    connected(sr, 0);
-    sr.shouldSend();
+    sr.connected();
+    expect(sr.barrierIsClear()).toBe(false);
+    sr.barrierCleared();
+    expect(sr.barrierIsClear()).toBe(true);
 
     sr.disconnected();
-    connected(sr, 2);
-    expect(sr.shouldSend()).toBe(false);
-    sr.sentRecord();
-    sr.sentRecord();
-    expect(sr.shouldSend()).toBe(true);
+    sr.connected();
+    expect(sr.barrierIsClear()).toBe(false);   // re-armed by the reconnect
   });
 });
