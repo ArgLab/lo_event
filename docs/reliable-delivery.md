@@ -78,15 +78,22 @@ it has been acked.
 ### Delivery semantics
 
 In the durable profile, delivery is **at-least-once**. In send-and-forget it
-is best-effort — effectively at-most-once per connection, since a rewind can
-still resend anything not yet confirmed-on-send. Either way, events can
-arrive twice (a resend after a lost ack) or out of order across reconnects.
-This is safe because the consumers
-are built for it: state is a fold over the event stream, reducers are
-idempotent and order-tolerant, and fields carry absolute values or CRDT
-merges. **Duplicates are always acceptable. Deletions of undelivered work
-never are.** Several of the historical bugs below come from forgetting which
-of those two categories an operation falls into.
+is plain **best-effort: it may lose and it may duplicate** (a rewind resends
+anything not yet confirmed-on-send, and two tabs can both send a shared
+record before either confirms — confirm-on-send prevents neither). Either
+way, events can arrive twice or out of order across reconnects.
+
+That is safe because of a **server-side contract**, not client-side hope:
+the server folds events into per-field state through reducers that are
+idempotent and order-tolerant, and fields that admit concurrent edits are
+**CRDTs, merged on the server** — a redelivered or reordered event
+converges to the same state by construction. This contract is what
+at-least-once transport leans on, and every new event type or reducer must
+honor it. (The one legacy exception — `save_blob`, a full-state overwrite
+that is neither idempotent-under-reorder nor merge-tolerant — is
+quarantined in §12.) **Duplicates are always acceptable. Deletions of
+undelivered work never are.** Several of the historical bugs below come
+from forgetting which of those two categories an operation falls into.
 
 ---
 
@@ -107,7 +114,9 @@ logEvent(e) ──▶ [ durable queue (IndexedDB) ] ──▶ send ──▶ ser
 In the browser, the durable queue is an IndexedDB object store with
 auto-incrementing integer keys (the **storage id**). Where IndexedDB is
 unavailable (Node, tests, SSR), an in-memory queue with the same interface
-substitutes — same semantics, no durability.
+substitutes — but be honest about what it drops: no durability, no
+cross-context sharing (the entire tab-close recovery story disappears),
+and storage ids restart per instance.
 
 **The queue is shared across tabs — precisely: across contexts in the same
 origin and storage partition.** That is deliberate, and it is the whole
@@ -124,7 +133,11 @@ it), while an extension background page and a regular page *never* share
 one (separate storage partitions — each is its own recovery domain), and a
 third-party iframe gets partitioned storage in current browsers, so
 cross-tab recovery silently does not span it. "Shared" means: same origin,
-same partition, same store name.
+same partition, same store name — **and one profile**. Every consumer of a
+store must have identical confirm semantics: a send-and-forget consumer
+draining a durable producer's store would confirm-on-send records the
+server never acked. So the store namespace includes the profile, and mixing
+profiles on one store is forbidden.
 
 ---
 
@@ -161,7 +174,9 @@ the next session checks it out again. The worst case is the server receiving
 a duplicate, which at-least-once delivery already tolerates.
 
 Note what is durable and what is not: the *items* are durable; the *cursor
-is not*. `leasedThrough` is per-tab, in-memory, and resets with the page.
+is not*. `leasedThrough` is per-Queue-*instance*, in-memory, and resets
+with the page (two instances in one context are two independent cursors —
+"leased by me" always means "by this instance").
 That asymmetry is correct — a lease is a claim about *this session's
 sending progress*, not a fact about the world — but it means any logic that
 reads the cursor must remember that other tabs have their own cursors over
@@ -198,6 +213,24 @@ unforgivable category.
 individually.** `confirm(seqs: number[])` — an explicit set, never a range.
 (Test: *"one sender's ack does not delete another sender's unsent
 records"*, `tests/queue.test.js`.)
+
+### The queue contract, in one place
+
+Everything a backend must implement (memory and IndexedDB are tested
+against the same contract, §9):
+
+- `enqueue(item)` — append; assigns the next storage id.
+- `leaseNext(): {seq, item}` — lowest stored id above the cursor, without
+  deleting; parks when none; woken by re-scan, never by hand-off (§3).
+- `confirm(seqs)` — delete exactly these ids.
+- `rewind()` — cursor to the bottom; unconfirmed records re-lease.
+- `unconfirmedCount()` — stored records (the logger-level `unackedCount()`
+  is the sum of this across ack-aware loggers; two names, one per layer).
+- `maxSeq()` — highest stored id, or null when empty.
+- `unleasedAtOrBelow(seq)` — stored, unleased-by-me, at or below `seq`.
+- `inspect(limit)`, `clear()` — debug/recovery only (§10); `clear()` is
+  the one sanctioned deletion of unsent work, reserved for junk stores and
+  the permanent-opt-out case (§5).
 
 ---
 
@@ -248,9 +281,21 @@ resent on every reconnect, forever. An identity-keyed ack is a fact about
 the world — *"the server durably has this event"* — that anyone can act on,
 on any connection, at any time. The sender maps the acked identity back to
 a storage id (via an in-memory `inFlight` map of what it has sent) and
-confirms exactly that record, **removing the map entry as it does** — the
-map holds only what is awaiting an ack, so it stays small. (What is stored:
-each queue record is the serialized JSON string of the frame, so reading an
+confirms exactly that record, **removing the map entry as it does**. Two
+rules on that map, both easy to get backwards:
+
+- **Register before the send attempt**, not after: an ack can arrive
+  faster than a post-send bookkeeping step, and an ack that finds no entry
+  is dropped (below) — leaving the record to resend forever.
+- **An ack for an identity not in the map is ignored.** That is correct
+  and non-obvious: it names a record some other connection sent (or one
+  already confirmed), and acting on it would require scanning the store
+  for the identity — and scanning-to-delete records you didn't send is how
+  L1 was violated the first time.
+
+The map's honest bound is one entry per unacked send — roughly the outbox's
+size, not "small" — and it empties as acks land. (What is stored: each
+queue record is the serialized JSON string of the frame, so reading an
 identity back out of a stored record means parsing it.)
 
 An earlier design used a third number — a per-connection wire counter — and
@@ -307,9 +352,35 @@ Loud, durable, recoverable; never a loss.
 Ordering per connection, in full:
 
 1. Socket opens. All per-connection state resets.
-2. `rewind()` runs and the backlog drains through leases.
-3. The flush barrier (§7) is measured **after** rewind, then evaluated.
-4. The state snapshot request goes out once the barrier clears (§6–7).
+2. The session's current **metadata frame** (browser info, lock fields —
+   the client's identity material) is enqueued, freshly stamped (L6). It
+   rides the outbox like any event: behind any recovered backlog, ahead of
+   everything this session logs after it. Events are held at the front
+   desk until this frame is ahead of them — so the server always meets a
+   session's metadata before its events.
+3. `rewind()` runs and the backlog drains through leases.
+4. The flush barrier (§7) is measured **after** rewind, then evaluated.
+5. The state snapshot request goes out once the barrier clears (§6–7).
+
+**Who the server thinks we are.** The server binds the connection to a
+principal at accept time — HTTP-layer auth (Basic via the proxy, LTI
+session, guest cookie) resolves *before* the WebSocket upgrade completes —
+so no frame is ever processed unattributed. The `{status:'auth'}` push is
+the server *telling* the client who it decided we are; the client never
+waits for it. (Sends may begin at socket open precisely because
+attribution already happened.)
+
+**Admission never blocks on the network.** Nothing between `logEvent()`
+and the outbox commit may wait on connection state, a server response, or
+the disabler — the only permitted hold is local metadata assembly (step 2),
+which must not depend on the network. Rate limiting and blocklists gate
+the **lease/send loop**, after durability: a blocked client keeps
+*accepting and storing* events and merely stops *sending* them. (The §7
+barrier under an engaged disabler opens via its deadline as a declared
+degradation — a commanded quiet period, not a bug.) The one exception is a
+**permanent opt-out** (a privacy request): draining the stored backlog
+would violate the opt-out, so this is the single sanctioned use of
+`clear()` — deletion of unsent work, on the user's own instruction.
 
 Every asynchronous callback tied to a connection (reconnect logic, barrier
 measurement, the barrier's fallback timer) carries a **connection
@@ -372,13 +443,14 @@ request is idempotent); never asking again is a hang. Additionally:
   re-checked constantly, and without a latch each re-check past the
   threshold fired another request — and the server built a full state blob
   for each.
-- **A new `request()` re-arms the latch**: a second snapshot request on a
-  long-lived connection is a new question, not a duplicate of the old one.
-  (A mid-session re-request does not wait on any barrier for events this
-  context generated — those are already reflected in local state, which is
-  the same assumption that lets §7 exclude post-watermark records. The
+- **A new `request()` re-arms the latch.** One honesty note: responses
+  carry no correlation id, so an older in-flight response can satisfy a
+  newer ask — a declared staleness window, accepted because mid-session
+  re-requests are rare and get rarer (subscription push replaces them).
+  A mid-session re-request does not wait on any barrier for events this
+  context generated — those are already reflected in local state. The
   barrier orders the snapshot after *foreign and prior-session* backlog
-  only.)
+  only.
 - **An unanswered ask times out and re-asks.** "Once per connection" bounds
   the burst, not the patience: a healthy-looking connection whose server
   never answers (dropped internally, failed mid-build) must not leave the
@@ -386,6 +458,18 @@ request is idempotent); never asking again is a hang. Additionally:
   timeout (~10s), re-arm the latch and ask again, loudly; asking is
   idempotent. Overlapping *responses* are benign for the same reason a
   reconnect re-ask is: whichever snapshot arrives resolves the load.
+
+**The load gate is load-bearing, not cosmetic.** At page load, "already in
+local state" is false — local state is empty, and the response *replaces*
+it wholesale — so any state-bearing event enqueued before the snapshot
+resolves gets no ordering protection (it lands above the watermark) and
+any local edit made in that window would be overwritten by the response.
+The rule: **no state-bearing event may be enqueued before the snapshot
+resolves.** Today that holds because the only pre-snapshot frames are the
+§5 metadata preamble and pageview-ish telemetry, and the "Loading user
+state…" screen keeps the user from editing. Both halves are part of the
+protocol: a rebuild (or a new caller) that lets state-bearing events jump
+the gate reintroduces the §7 bug from this session's own keyboard.
 
 ---
 
@@ -476,6 +560,12 @@ each a fixed bug:
 - **Un-evaluated refuses to send.** The barrier has three states —
   un-evaluated / pending / clear — and only *clear* permits the request.
   Never represent un-evaluated as zero.
+- **Clearance latches per connection.** Once clear, a later mid-connection
+  `rewind()` (a failed send's recovery, §3) does not re-close it: the
+  snapshot was ordered after the backlog that existed at connection start,
+  which is all this barrier promises, and re-closing would let a §6
+  timeout re-ask hang behind live traffic. §3's "puts it back in the
+  count" therefore matters only before first clearance.
 - **Probes respect the lease-to-send window.** The cursor advances at
   *lease* time, a moment before the frame is on the wire; a probe resolving
   inside that window would clear the barrier one record early. A
@@ -544,9 +634,18 @@ resent on every reconnect forever. All frames the logger constructs itself
 not gated on any verbosity flag.
 *(util.test.js: "identity survives verboseEvents being off")*
 
-**L6. Stamp copies, not long-lived objects.** `timestampEvent` writes into
-its argument; stamping the persistent metadata dict itself would burn one
-identity into every future frame. Copy first.
+**L6. Identity is minted at the enqueue boundary — fresh every enqueue,
+reused every resend, never re-enqueued.** Three clauses, each broken once:
+`timestampEvent` writes into its argument, so stamping a long-lived object
+(the persistent metadata dict) burns one identity into every future frame —
+copy first. The old logger went further: it *absorbed* a stamped frame
+into the metadata dict and re-enqueued that dict on every reconnect, so an
+already-used identity re-entered the store as a new record — and since the
+in-flight map holds one storage id per identity, the ack could only ever
+confirm one of them; its twins resent forever. The rule that closes the
+whole class: **every `enqueue()` stamps a fresh identity; a *resend* of a
+stored record reuses the record's identity (that is the point of acks);
+an object that has ever carried an eventId is never enqueued again.**
 
 **L7. Unnamed records drain, best-effort — a declared exception to L2/L3.**
 A stored record with no `metadata.eventId` (a pre-identity build's
@@ -565,9 +664,11 @@ is: a live stamping bug, not legacy residue.
 **L8–L10. The flush barrier** (§7): the snapshot request must not overtake
 the connection-start backlog (L8); the barrier must be asked of the queue —
 un-evaluated is a distinct state, counts are not quotas on a shared store
-(L9); no barrier probe may run before this connection's `rewind()` has
-completed — the predicate reads the lease cursor, and a pre-rewind cursor
-makes the whole backlog look leased (L10).
+(L9); no barrier probe **and no lease** may run before this connection's
+`rewind()` has completed — both read the lease cursor, and a pre-rewind
+cursor makes the whole backlog look leased (a stale probe clears the
+barrier spuriously; a stale lease silently *skips the backlog entirely*,
+which is worse) (L10).
 *(queue.test.js: "flush barrier" describe block — cross-tab drain clears
 rather than starves; live typing never defers; measure-after-rewind.
 stateRequest.test.js: refuses to send un-evaluated.)*
@@ -627,19 +728,28 @@ by a human reading a diff.
 **Rule: protocol decisions live in pure code; I/O lives in thin adapters.**
 The decision core — confirm bookkeeping (both profiles), the snapshot
 latch and barrier, reconnect behavior — is a *sans-I/O engine*: it
-consumes facts (`connected`, `frameReceived`, `enqueued`, `recordLeased`,
-`sendCompleted`, `sendFailed`, `ackReceived(id)`, `probeResult(n)`,
-`measurementFailed`, `elapsed(ms)`, `disconnected`) and returns decisions
-(`sendFrame`, `confirmIds`, `probeQueue`, `rewind`, `askForState`). Two
-notes on that list, both bugs-in-waiting if skipped: **time is a fact**
-(`elapsed`) — the §7 fallback cadence, the barrier deadline, and the §6
-re-ask timeout are all decisions the engine makes when *told* time has
-passed, so tests drive them without timers; and facts that answer an
-earlier decision (`probeResult`, `sendCompleted`) must carry the
-connection generation they belong to, or a slow answer from connection N
-is indistinguishable from one for N+1. The WebSocket adapter and the
-queue backends feed it and obey it, and contain no decisions of their
-own.
+consumes facts (`connected`, `frameReceived`, `enqueued`,
+`recordLeased(seq, eventId | null)`, `sendCompleted`, `sendFailed`,
+`ackReceived(id)`, `watermarkResult(n | null)`, `probeResult(n)`,
+`measurementFailed`, `elapsed(ms)`, `disablerEngaged`/`disablerReleased`,
+`disconnected`) and returns decisions (`sendFrame`, `confirmIds`,
+`measureWatermark`, `probeQueue`, `rewind`, `pauseSending`/`resumeSending`,
+`closeSocket`, `askForState`). Notes on that list, each a bug-in-waiting
+if skipped: **time is a fact** (`elapsed`) — the §7 fallback cadence, the
+barrier deadline, and the §6 re-ask timeout are all decisions the engine
+makes when *told* time has passed, so tests drive them without timers.
+Facts that answer an earlier decision (`watermarkResult`, `probeResult`,
+`sendCompleted`) must carry the connection generation they belong to, or a
+slow answer from connection N is indistinguishable from one for N+1 —
+`ackReceived` is the deliberate exception, generation-free, because an
+identity ack is a fact about the world (§4). `recordLeased` carries the
+parsed-out identity (or null) because L7 is a per-record protocol
+decision; extracting it from the stored JSON is the adapter's job, with
+exactly that defined output. And the disabler facts are in the alphabet
+because §5 places rate-limit gating at the send stage — a protocol
+decision, so it must live here, not in the adapter. The WebSocket adapter
+and the queue backends feed it and obey it, and contain no decisions of
+their own.
 
 Consequences:
 
@@ -721,10 +831,12 @@ deleted with it — §5.)
   backlog into the socket's local buffer. A bounded in-flight window
   (count or bytes, resumed on acks / low `bufferedAmount`) is the natural
   durable-mode mechanism.
-- **Poison records / nack.** The server today never rejects an event; a
-  hypothetical permanent rejection would sit in a durable queue forever.
-  If nacks ever exist, they need a dead-letter policy that preserves the
-  payload. Deliberately unspecified until the server can say no.
+- **Poison records / nack.** The server today never rejects a *queued
+  record* (`save_blob_nack` reports a failed save attempt, not a rejected
+  record — §12); a hypothetical permanent rejection would sit in a durable
+  queue forever. If record-level nacks ever exist, they need a dead-letter
+  policy that preserves the payload. Deliberately unspecified until the
+  server can say no.
 - **Unload.** No `pagehide`/`visibilitychange` handling is specified —
   the "last few seconds" case rides entirely on the outbox commit having
   already happened. Worth revisiting with the admission contract.
@@ -751,6 +863,12 @@ are distinguished by `event`; server→client frames by `status`.
 | metadata / lock fields | stamped like any event | yes |
 | snapshot request | `{event: 'fetch_blob'}` | **never** (§6) |
 
+The protocol's `event` names (`fetch_blob`, `save_blob`, and any future
+protocol frame) are **reserved**: application events share the same field,
+and an app event named like a protocol frame would be misparsed on every
+redelivery, forever. The client refuses to enqueue an application event
+bearing a reserved name.
+
 **Server → client**
 
 | frame | meaning |
@@ -762,12 +880,29 @@ are distinguished by `event`; server→client frames by `status`.
 | `{status: 'blocklist', message, time_limit, action}` | stop sending (rate limit / opt-out); feeds the disabler, which gates the lease loop |
 | `{status: 'local_storage', key, value}` / `{status: 'browser_event', ...}` | server-pushed side channels; unrelated to delivery |
 
-Note **`save_blob` has two acknowledgments doing two jobs**: the identity
-ack (`ack` + eventId) confirms the *queue record* — it drives deletion from
-the outbox like any event — while `save_blob_ack` + token drives the
-*UI save status* (reduxLogger compares it against the newest token, so a
-stale ack never marks newer edits saved). A nack leaves the record's
-delivery status untouched; it only reports the save attempt.
+### `save_blob` is legacy — quarantined, scheduled for demolition
+
+`save_blob` is a **full-state overwrite**, and therefore the one frame that
+violates §1's consumer contract: it is neither idempotent-under-reorder nor
+merge-tolerant. It is the interim persistence mechanism from before
+per-field events; the destination is field-level events folded through
+server-side CRDTs, at which point `save_blob` is deleted. Until then, its
+hazards are **declared, contained, and not worth engineering around**:
+
+- **Stale redelivery can regress state.** A dead session's unacked
+  `save_blob`, recovered and redelivered, folds over anything newer —
+  wrong in a way no client ordering can fix, since tokens are per-session.
+  Contained by: blobs are superseded wholesale by the next save, and the
+  field-event migration removes the frame. Do not add version vectors to a
+  frame we are deleting.
+- **Two acknowledgments, two jobs.** The identity ack confirms the *queue
+  record* (outbox deletion, like any event); `save_blob_ack`/`nack` + token
+  drives the *UI save status* (compared against the newest token, so a
+  stale ack never marks newer edits saved). An ack-then-nack sequence
+  therefore consumes the record while the save failed: the UI correctly
+  shows unsaved, and recovery is the next save (full state again). If no
+  further edit ever happens, that blob attempt is lost — a declared legacy
+  hazard, accepted for the same reason as above.
 
 ### A durable session, annotated
 
@@ -781,7 +916,7 @@ client-local actions.
 <  {"status":"auth","user_id":"u-217"}
 >  {"event":"save_blob","blob":{...},"token":7,"metadata":{"eventId":"B.S1.38",...}}   # id 41 leased, sent
 >  {"event":"answer","qid":"q3","value":"...","metadata":{"eventId":"B.S1.39",...}}    # id 42 leased, sent
-   unleasedAtOrBelow(42) == 0  →  barrier clear                                        # §7
+   unleasedAtOrBelow(42) == 0  →  barrier clear     # probed after the send completed — §7's in-flight interlock
 >  {"event":"fetch_blob"}                                    # only now — after the backlog
    user types; enqueue id 43 (eventId B.S2.1); leased, sent
 >  {"event":"keystroke","key":"e","metadata":{"eventId":"B.S2.1",...}}
