@@ -153,29 +153,25 @@ export class Queue {
    */
   async addItemToDB (op: DBOperation) {
     const payload = op.payload!;
-    if (this.nextItemPromise) {
-      this.nextItemPromise(payload.payload);
-      this.nextItemPromise = null;
-      return;
-    }
+    // ABLATED (cleanroom rebuild — fill in): two "fast paths" lived here that
+    // resolved a parked consumer directly with the in-flight item, and both
+    // were wrong in the same way — they bypassed the store:
+    //   (a) destructive path: a parked dequeue consumer was handed the item
+    //       WITHOUT it ever being written to the DB. On a live page this was
+    //       the common case, so "durable" items routinely never touched disk.
+    //   (b) lease path: a parked lease consumer was handed the freshly
+    //       assigned id and leasedThrough jumped to it — skipping over any
+    //       ids OTHER tabs enqueued into the shared store while we were
+    //       parked. Those records went unsent until the next rewind.
+    // FILL IN: after the add transaction commits, wake any parked consumer by
+    // RE-RUNNING ITS SCAN against the store (nextItemFromDB / leaseFromDB) —
+    // never by handing it the item that woke it. The store is the only
+    // authority on what comes next.
     debug.info(`idbQueue: adding item to database, ${payload}`);
     const transaction = this.db!.transaction([this.queueName], 'readwrite');
     const objectStore = transaction.objectStore(this.queueName);
 
     const request = objectStore.add(payload);
-
-    request.onsuccess = () => {
-      // A parked lease consumer (leaseNext on an empty queue) is waiting for
-      // the next item. autoIncrement assigned its id here, so hand it out now
-      // (non-destructively — it stays in the DB until confirm()ed).
-      const newId = request.result as number;
-      if (this.nextLeasePromise && newId > this.leasedThrough) {
-        const resolve = this.nextLeasePromise;
-        this.nextLeasePromise = null;
-        this.leasedThrough = newId;
-        resolve({ seq: newId, item: payload.payload });
-      }
-    };
 
     request.onerror = () => {
       if (request.error?.name === 'ConstraintError') {
