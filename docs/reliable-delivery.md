@@ -35,6 +35,28 @@ The promise this protocol makes:
 
 Everything below is machinery in service of that one sentence.
 
+### Two profiles, one flag
+
+Not every application wants to pay for the full promise. lo_event serves two
+kinds of deployment, and the difference is a single configuration flag on
+the logger, **`autoack`**:
+
+- **durable** (`autoack: false`, the default) — an event is deleted from the
+  client only when the server acknowledges capturing it. This is the mode
+  the promise above describes, and the mode lo-blocks uses.
+- **send-and-forget** (`autoack: true`) — the client confirms each event *to
+  itself* the moment the send succeeds. For high-volume observational
+  telemetry (e.g. an extension background page streaming events) where the
+  accepted loss window is "the socket buffered it and then the connection
+  died."
+
+Both profiles run the *same pipeline* — same queue, same leases, same
+confirm-by-explicit-id, same rewind-on-reconnect. The flag changes exactly
+one thing: *who signs for a sent event, and when* (§5). The mode is chosen
+by the application at configuration time; client and server deployments are
+coordinated, so the client never infers the server's dialect at runtime
+(L12).
+
 ### What the server promises back
 
 The server acknowledges ("acks") an event only after appending it to its
@@ -46,8 +68,11 @@ it has been acked.
 
 ### Delivery semantics
 
-Delivery is **at-least-once**. Events can arrive twice (a resend after a lost
-ack) or out of order across reconnects. This is safe because the consumers
+In the durable profile, delivery is **at-least-once**. In send-and-forget it
+is best-effort — effectively at-most-once per connection, since a rewind can
+still resend anything not yet confirmed-on-send. Either way, events can
+arrive twice (a resend after a lost ack) or out of order across reconnects.
+This is safe because the consumers
 are built for it: state is a fold over the event stream, reducers are
 idempotent and order-tolerant, and fields carry absolute values or CRDT
 merges. **Duplicates are always acceptable. Deletions of undelivered work
@@ -95,13 +120,17 @@ A classic queue has one read operation: **dequeue** — take the next item
 event, send it, and the tab dies before the ack, the event is gone from disk
 and from the world.
 
-So the outbox uses a **lease** discipline instead, with three operations:
+So the outbox uses a **lease** discipline instead — the *only* read
+discipline this queue has; there is no destructive dequeue — with three
+operations:
 
 - **`leaseNext()`** — hand out the next item *without deleting it*. The item
   stays on disk. An in-memory cursor (`leasedThrough`) advances so the next
   lease hands out the following item rather than the same one again.
-- **`confirm(ids)`** — delete items, by explicit id, once they are known
-  captured (acked). This is the *only* way items leave the store.
+- **`confirm(ids)`** — delete items, by explicit id, once they are signed
+  for. This is the *only* way items leave the store. Who signs depends on
+  the profile (§5): the server's ack (durable), or the sender itself at
+  send time (send-and-forget). The queue does not know or care which.
 - **`rewind()`** — reset the cursor to the beginning. Called on every
   reconnect: anything still stored (i.e., not confirmed) gets leased — and
   therefore sent — again.
@@ -175,54 +204,78 @@ socket, which is exactly wrong for a shared store where one tab may deliver
 another tab's leftovers. It was removed; do not reintroduce it. Because
 identity is what gets acked, **identity is load-bearing**: every frame that
 enters the durable queue MUST carry `metadata.eventId` (see landmine 5), and
-identity stamping must never be gated behind a verbose/debug flag.
+identity stamping must never be gated behind a verbose/debug flag. Both
+profiles stamp — in send-and-forget mode nothing acks the identity, but
+dedup, analytics, and forensics still key on it, and a store must never
+depend on which profile wrote it.
 
 ---
 
-## 5. The connection: capabilities, and refusing to guess
+## 5. The connection: two confirm sources, one flag
 
-Not every server speaks this protocol. lo_event also serves older,
-"legacy" deployments whose servers never ack. The client must know which
-kind it is talking to *before it sends anything*, because the two modes
-handle the queue oppositely:
+Everything in §2–§3 runs identically in both profiles. The single point of
+difference is what event causes `confirm()`:
 
-- **ack mode** — send, keep the record until acked, then confirm.
-- **legacy mode** — send and confirm immediately ("delete on send"). No
-  durability promise; this is the pre-protocol behavior, preserved
-  byte-identically for old servers.
+- **durable** (`autoack: false`) — after sending a leased record, remember
+  it in the in-flight map (§4) and wait. Confirm when the server's
+  `{status:'ack', id}` arrives, and only then.
+- **send-and-forget** (`autoack: true`) — confirm the record immediately
+  after `socket.send()` returns without throwing. The client is signing its
+  own receipt; the accepted loss window is exactly "buffered but the
+  connection died."
 
-Capability negotiation: the server's **first frame** on a connection is
-`{status: 'hello', capabilities: {ack: true, ...}}`. The client holds a
-**capability gate** closed until either the hello arrives (authoritative) or
-a grace window (~3s) expires with no hello (assume legacy). **Nothing is
-sent while the gate is closed** — the window between socket-open and hello
-is exactly where `rewind()` wants to resend the durable backlog, and sending
-that backlog in legacy delete-on-send mode against a server that actually
-supports acks would destroy the durability of every record in it.
+That is the entire mode switch. There is no runtime negotiation: the
+application states the mode at configuration time, and client and server
+deployments are coordinated. A **misconfigured** pair is visible, not
+silent: a durable client against a server that never acks confirms nothing,
+so the queue only grows — `unackedCount()` climbs, the unsaved-work warning
+fires, and `loDebug.queue()` shows a backlog of perfectly named records.
+Loud, durable, recoverable; never a loss.
 
-Some clients cannot accept legacy at all. lo-blocks sets **`requireAck`**:
-if the server does not advertise `ack`, the client refuses to send — it
-keeps the gate closed so events accumulate durably, logs loudly, and raises
-a sticky fatal signal (`lo_fatal`, surfaced to the UI via the `useFatal()`
-hook as a "saving is unavailable" banner). A require-ack client silently
-falling back to legacy would silently lose events, which is the exact bug
-the protocol exists to fix. Fail loudly; hold the queue; recover cleanly if
-a late ack-capable hello arrives.
+> **History, and a warning.** An earlier design treated the mode as a
+> *server capability* to be discovered per connection: a `hello` frame
+> advertising `{ack: true}`, a ~3s grace timer whose expiry meant "assume
+> the old server," a capability gate holding all sends until the guess
+> resolved, and a `requireAck` escape hatch with a sticky fatal banner for
+> clients that couldn't accept the downgrade. All of it existed so the
+> client could guess what it was talking to, and the guessing is where the
+> bugs lived — send-before-mode-known races, timers firing into the wrong
+> connection, silent downgrades. Coordinated rollouts make the guess
+> unnecessary. Do not reintroduce runtime mode detection; if profiles ever
+> need to vary per deployment, vary the *configuration*, not the handshake.
 
 Ordering per connection, in full:
 
-1. Socket opens. All per-connection state resets; capability gate is closed.
-2. Server sends `hello` (capabilities), then `auth` (user identity).
-3. Gate opens (hello, or grace-timeout-as-legacy). **Then** `rewind()` runs
-   and the backlog drains through leases.
-4. The flush barrier (§7) is measured **after** rewind, then evaluated.
-5. The state snapshot request goes out once the barrier clears (§6–7).
+1. Socket opens. All per-connection state resets.
+2. `rewind()` runs and the backlog drains through leases.
+3. The flush barrier (§7) is measured **after** rewind, then evaluated.
+4. The state snapshot request goes out once the barrier clears (§6–7).
 
-Every asynchronous callback tied to a connection (grace timer, gate
-continuation, barrier measurement) carries a **connection generation
-number** and no-ops if the connection has changed by the time it fires. A
-stale timer from connection N firing into connection N+1's state was a real
-deadlock once; the generation guard is the uniform cure.
+Every asynchronous callback tied to a connection (reconnect logic, barrier
+measurement, the barrier's fallback timer) carries a **connection
+generation number** and no-ops if the connection has changed by the time it
+fires. A stale timer from connection N firing into connection N+1's state
+was a real deadlock once; the generation guard is the uniform cure.
+
+### What the flag deletes
+
+For the rebuild, the collapse from negotiated-capability to configured-flag
+removes, with nothing replacing them:
+
+- the `hello`/capability handshake, the grace timer, and the capability
+  gate (sends may begin as soon as the socket is open);
+- the `requireAck` option, the `lo_fatal` event, `FatalState` in
+  reduxLogger, and the `useFatal()` hook — the misdeploy they guarded
+  against is now a visible, recoverable misconfiguration (above);
+- the destructive dequeue discipline (`dequeue()` / `onDequeue`) from the
+  *outbox* — send-and-forget uses leases plus confirm-on-send, so no
+  delivery path needs delete-on-read. (One non-delivery consumer remains:
+  loEvent's in-process front-desk queue, which buffers events before
+  loggers initialize and dispatches destructively. Either migrate it to
+  lease-and-confirm or keep `dequeue()` as a front-desk-only affordance —
+  but the websocket logger must not touch it.);
+- the "unnamed records get special legacy treatment" rule — see L7, which
+  shrinks to one sentence.
 
 ---
 
@@ -378,11 +431,11 @@ not gated on any verbosity flag.
 its argument; stamping the persistent metadata dict itself would burn one
 identity into every future frame. Copy first.
 
-**L7. Unnamed legacy records drain, best-effort.** Records enqueued by
-pre-identity builds exist in real stores. In ack mode they are sent and
-confirmed immediately (delete-on-send is the guarantee they were created
-under) with a loud log — because post-transition, an unnamed frame means an
-enqueue path forgot to stamp. Draining beats leaking either way.
+**L7. Unnamed records drain, best-effort.** A stored record with no
+`metadata.eventId` (a pre-identity build's leftover, or an enqueue path
+that forgot to stamp) can never be acked. A durable-mode client sends it
+and confirms on send — per-record send-and-forget semantics — with a loud
+log, because draining beats resending it on every reconnect forever.
 
 **L8–L10. The flush barrier** (§7): the snapshot request must not overtake
 the connection-start backlog (L8); the barrier must be asked of the queue —
@@ -398,19 +451,21 @@ scoped, ask-once-per-connection latch, re-ask on reconnect, latch re-armed
 by a new request. (§6.)
 *(stateRequest.test.js: the "ask once per connection" describe block)*
 
-**L12. Nothing sends before the capability mode is known.** The gate holds
-all sends until hello or grace; `rewind()` runs only after the gate opens.
-`requireAck` + no ack capability = hold the queue + sticky `lo_fatal`,
-never legacy.
+**L12. Mode is configuration, never negotiation.** The confirm source
+(`autoack`) is stated by the application; the client never infers the
+server's dialect from a handshake or a timeout. In particular, a durable
+client never downgrades itself to confirm-on-send at runtime — a
+misconfigured pair shows up as a growing queue (recoverable), never as
+silent deletion (not).
 
-**L13. A closing connection must release, not strand.** On disconnect the
-gate is opened (so a parked send unblocks), but `READY` is already false, so
-the unblocked send *skips* — no send, no confirm; the record stays for the
-next rewind. Skipping either half of that reintroduces a deadlock (send
-parked forever) or a loss (legacy confirm of an unsent record).
+**L13. A closing connection must release, not strand.** A send parked on a
+dead or dying connection must *unblock and skip* — no send, no confirm; the
+record stays leased-but-stored for the next rewind. Skipping either half
+reintroduces a deadlock (send parked forever) or a loss (a confirm-on-send
+of a record that never went out).
 
 **L14. Guard every cross-async callback with a connection generation.**
-Grace timers, gate continuations, barrier measurements: capture the
+Reconnect timers, barrier measurements, fallback probes: capture the
 generation when scheduled, no-op if it moved. Bump the generation on close
 as well as on open, so callbacks from a dying connection cannot fire into a
 connecting one.
@@ -426,11 +481,12 @@ promise unsettled forever.
 **L16. `eventId` is opaque.** Compare it, grep it, never split it. The
 components travel alongside for structural needs.
 
-**L17. Failure degrades toward the old behavior, loudly.** Unreadable
+**L17. Failure degrades toward worse service, loudly.** Unreadable
 count/store → no barrier (stale snapshot, not a hang). Unnamed frame →
-best-effort send (duplicate-ish, not a leak). Ack-less server without
-`requireAck` → legacy mode. Every degradation logs. The protocol's failure
-modes must be *worse service*, never *silent loss* and never *hang*.
+best-effort send (duplicate-ish, not a leak). Server not acking a durable
+client → the queue holds and warns (unsaved, not lost). Every degradation
+logs. The protocol's failure modes must be *worse service*, never *silent
+loss* and never *hang*.
 
 ---
 
@@ -443,14 +499,13 @@ IndexedDB. Three regressions in a row shipped through that gap, each found
 by a human reading a diff.
 
 **Rule: protocol decisions live in pure code; I/O lives in thin adapters.**
-The decision core — capability gating, ack/confirm bookkeeping, the
-snapshot latch and barrier, reconnect behavior — is a *sans-I/O engine*: it
-consumes facts (`connected`, `helloReceived(caps)`, `frameReceived`,
-`recordLeased`, `sendCompleted`, `ackReceived(id)`, `probeResult(n)`,
-`graceExpired`, `disconnected`) and returns decisions (`sendFrame`,
-`confirmIds`, `openGate`, `probeQueue`, `signalFatal`, `askForState`). The
-WebSocket adapter and the queue backends feed it and obey it, and contain
-no decisions of their own.
+The decision core — confirm bookkeeping (both profiles), the snapshot
+latch and barrier, reconnect behavior — is a *sans-I/O engine*: it
+consumes facts (`connected`, `frameReceived`, `recordLeased`,
+`sendCompleted`, `ackReceived(id)`, `probeResult(n)`, `disconnected`) and
+returns decisions (`sendFrame`, `confirmIds`, `probeQueue`,
+`askForState`). The WebSocket adapter and the queue backends feed it and
+obey it, and contain no decisions of their own.
 
 Consequences:
 
@@ -486,10 +541,10 @@ stuck tab, where there is no module to import):
   purpose: it exists to recover a store holding junk a broken build left
   behind. Never on a queue believed to hold real work.
 
-The `useConnected()` / `useSaved()` / `useLoaded()` / `useFatal()` hooks are
-the reactive UI surface for connection, save, snapshot, and fatal state
-respectively; `useFatal()` is what renders the require-ack misdeploy
-banner.
+The `useConnected()` / `useSaved()` / `useLoaded()` hooks are the reactive
+UI surface for connection, save, and snapshot state. (`useFatal()` and the
+`lo_fatal` event existed only for the `requireAck` misdeploy banner and are
+deleted with it — §5.)
 
 ---
 
