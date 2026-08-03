@@ -153,6 +153,30 @@ places where one of them was better, adopted here with a test each:
   race a round-1 build lost), and loEvent's fan-out contract, covering
   `configure()` and sibling isolation when a logger throws (sol).
 
+Two further defects sol found by reviewing this build, both real and both
+fixed here:
+
+- **`retry()` could clear a block that was extended while it slept.** It read
+  `expiration` once on entry and cleared the state unconditionally afterwards,
+  so a second blocklist frame arriving mid-sleep — extending the block, or
+  upgrading it to permanent — was wiped out when the original sleep finished,
+  and the client resumed sending straight through it. The deadline is now
+  re-read after every sleep, in `disabler.retry()`, which is the function that
+  owns the state. *(disabler.test.js: "does not clear a block that was EXTENDED
+  while it slept", "reports a block UPGRADED to permanent while it slept" —
+  both verified to fail against the old snapshot-the-deadline behavior.)*
+- **The barrier probe's zero-count fast path was not covered by the queue's
+  epoch check.** `unleasedAtOrBelow` returns 0 synchronously when the cursor is
+  already past the watermark, and re-counting inside the queue cannot help
+  anyway: the same race exists between the promise resolving and its consumer
+  acting on the number. The guard therefore moved to where the answer is
+  *consumed* — websocketLogger bumps a probe epoch on every rewind and drops
+  answers from before it, which covers both paths and both backends. The
+  reachable case is a rewind that does *not* bump the connection generation: a
+  lease that surfaces while a blocklist has sending paused. Narrow enough that
+  a timing test would pass with or without the guard, so it is covered by
+  reasoning rather than by a test that would prove nothing.
+
 Not adopted, deliberately:
 
 - **A serialized fact lane** (sol's `submit()`). It exists so that decisions

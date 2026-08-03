@@ -149,6 +149,9 @@ export function websocketLogger (
   let WSLibrary: new (url: string) => WebSocket;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let waitingOnDisabler = false;
+  /** Bumped by every rewind. A barrier probe issued before one has been
+   *  answered about a cursor that has since moved, so its answer is dropped. */
+  let probeEpoch = 0;
   /** The session's locked context fields, replayed as a freshly stamped frame
    *  on every connection (§5 step 2). We keep the *fields*, never a stamped
    *  frame: an object that has ever carried an eventId is never enqueued again
@@ -164,6 +167,13 @@ export function websocketLogger (
       switch (decision.do) {
         case 'rewind':
           store().rewind();
+          // Any probe already in flight was counted against the cursor this
+          // rewind just moved, so its answer describes a world that no longer
+          // exists. A stale *zero* is the dangerous one: it clears the flush
+          // barrier while the rewound backlog is still unsent, which is exactly
+          // the ordering §7 exists to prevent. Invalidate them all; the barrier
+          // re-probes on its own cadence.
+          probeEpoch++;
           break;
 
         case 'measureWatermark': {
@@ -180,8 +190,9 @@ export function websocketLogger (
 
         case 'probeQueue': {
           const gen = engine.generation();
+          const epoch = probeEpoch;
           store().unleasedAtOrBelow(decision.watermark).then(
-            unleased => apply(engine.probeResult(gen, unleased)),
+            unleased => { if (epoch === probeEpoch) apply(engine.probeResult(gen, unleased)); },
             error => {
               debug.error('websocketLogger: could not probe the outbox', error);
               apply(engine.measurementFailed(gen, 'probe'));
@@ -472,17 +483,22 @@ export function websocketLogger (
     if (mode === 'temporary') awaitDisablerRelease();
   }
 
-  /** Wait out a temporary block: `disabler.retry()` sleeps until the expiry and
-   *  returns true. A blocked client goes on accepting and storing events the
-   *  whole time — only sending is paused (§5). */
+  /** Wait out a temporary block: `disabler.retry()` sleeps until the block has
+   *  actually expired — including any extension that arrived while it slept —
+   *  and returns false if it became permanent instead, which is a different
+   *  block and gets engaged as one. A blocked client goes on accepting and
+   *  storing events the whole time; only sending is paused (§5). */
   async function awaitDisablerRelease () {
     if (waitingOnDisabler) return;
     waitingOnDisabler = true;
+    let released: boolean;
     try {
-      if (await disabler.retry()) apply(engine.disablerReleased());
+      released = await disabler.retry();
     } finally {
       waitingOnDisabler = false;
     }
+    if (released) apply(engine.disablerReleased());
+    else engageDisabler();
   }
 
   // ──────────────────────────────────────────────────── the logger surface

@@ -128,20 +128,30 @@ export function currentMode (): BlockMode {
 }
 
 /**
- * Determines if a client should retry based on the `expiration` status.
- * This function:
- * 1. Returns `false` if the expiration is permanent.
- * 2. Waits for the expiration to pass, resets `storage` (for future
- *    initializations), and then returns `true` to allow a retry.
+ * Sleep until sending is allowed again. Returns true once the block has
+ * genuinely expired, false if it is (or becomes) permanent.
+ *
+ * The deadline is re-read after every sleep, and that is the whole point of the
+ * loop: a second blocklist frame can arrive *while we are waiting* — extending
+ * the block, or upgrading it to permanent. Reading `expiration` once on entry
+ * and clearing the state unconditionally afterwards would let the sleep that
+ * started under the old, shorter block wipe out the newer one, and the client
+ * would resume sending straight through a block the server had just extended.
  */
 export async function retry () {
-  if (expiration === TIME_LIMIT.PERMANENT) {
-    return false;
-  }
-  const now = Date.now();
-  if (now < expiration!) {
-    debug.info(`waiting for expiration to happen ${new Date(expiration!).toString()}`);
-    await util.delay(expiration! - now);
+  while (true) {
+    if (expiration === TIME_LIMIT.PERMANENT) {
+      return false;
+    }
+    if (expiration === null) {
+      return true;                       // nothing is blocking us
+    }
+    const remaining = expiration - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    debug.info(`waiting for expiration to happen ${new Date(expiration).toString()}`);
+    await util.delay(remaining);
     debug.info('we are done waiting');
   }
   action = DEFAULTS.action;
