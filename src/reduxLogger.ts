@@ -45,13 +45,6 @@ interface ReduxAction extends JSONObject {
 export type SaveStatus = 'saved' | 'modified' | 'error';
 
 /**
- * A fatal, sticky condition surfaced by a logger (currently websocketLogger's
- * requireAck mis-deploy: ACK_REQUIRED). Null = no fatal. Sticky until the
- * logger clears it (e.g. a late ack-capable hello recovers the connection).
- */
-export type FatalState = { code: string; message: string } | null;
-
-/**
  * Options for the Redux logger's persistence behavior.
  *
  * serializeForSave:  Called before every save (server and localStorage).
@@ -156,7 +149,6 @@ function debug_log (...args: unknown[]) {
 
 let _saveStatus: SaveStatus = 'saved';
 let _connected: boolean | null = null;  // null = no websocket configured
-let _fatal: FatalState = null;          // sticky fatal condition (e.g. ACK_REQUIRED)
 
 // Monotonic token: incremented on each save_blob dispatch, compared against
 // the token echoed back in save_blob_ack. Status is 'saved' only when the
@@ -201,15 +193,6 @@ function setConnected (value: boolean) {
   }
 }
 
-// Sticky: set on a fatal condition, cleared (null) when the logger recovers.
-// Keyed by code so a repeated dispatch of the same fatal doesn't churn listeners.
-function setFatal (value: FatalState) {
-  if ((_fatal?.code ?? null) !== (value?.code ?? null)) {
-    _fatal = value;
-    notifyStatusListeners();
-  }
-}
-
 /** Subscribe to persistence status changes (save status, connected, loaded). */
 export function subscribeStatus (listener: () => void): () => void {
   _statusListeners.add(listener);
@@ -224,9 +207,6 @@ export function getConnected (): boolean | null { return _connected; }
 
 /** Snapshot of loaded status (a fetch_blob load cycle has resolved). */
 export function getLoaded (): boolean { return IS_LOADED; }
-
-/** Snapshot of the sticky fatal condition (null = none). */
-export function getFatal (): FatalState { return _fatal; }
 
 // =============================================================================
 // Load / Save
@@ -690,13 +670,6 @@ util.consumeCustomEvent('auth', handleAuth);
 util.consumeCustomEvent('lo_connection_status', (data: unknown) => {
   const { connected } = data as { connected: boolean };
   setConnected(connected);
-});
-
-// Fatal conditions from a logger (websocketLogger's ACK_REQUIRED). detail is
-// { code, message } to set, or null to clear on recovery. Surfaced reactively
-// via useFatal() — do NOT consume this event in app code (bypasses React).
-util.consumeCustomEvent('lo_fatal', (data: unknown) => {
-  setFatal((data as FatalState) ?? null);
 });
 
 // Server acknowledgment of a save_blob write.

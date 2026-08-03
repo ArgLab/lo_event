@@ -1,9 +1,9 @@
-// TODO: Test both types of queue, and then in node and
-// browser, as well as various failure conditions.
-
 import { describe, it, expect } from 'vitest';
 import { Queue } from '../src/queue.js';
 import { Queue as MemoryQueue } from '../src/memoryQueue.js';
+import { queueContract } from './queueContract.js';
+
+queueContract('memory', label => new MemoryQueue(`shared-${label}-${crypto.randomUUID()}`));
 
 describe('Queue', () => {
   it('dequeues items in FIFO order', async () => {
@@ -113,25 +113,6 @@ describe('MemoryQueue lease / confirm / rewind', () => {
     q.enqueue('late');
     await pending;
     expect(resolved).toEqual({ seq: 1, item: 'late' });
-  });
-});
-
-// The lease loop (queue.ts) drives onLease non-destructively; confirm is
-// external (server ack). Autodetects the in-memory backend under Node.
-describe('Queue lease loop', () => {
-  it('onLease receives leased items and does not delete until confirm', async () => {
-    const q = new Queue('lease-loop');
-    const received = [];
-    q.enqueue('x'); q.enqueue('y');
-
-    q.startDequeueLoop({ onLease: (leased) => { received.push(leased); } });
-    await new Promise(r => setTimeout(r, 50));
-
-    expect(received).toEqual([{ seq: 1, item: 'x' }, { seq: 2, item: 'y' }]);
-    expect(await q.unconfirmedCount()).toBe(2);  // held pending ack
-
-    q.confirm([1, 2]);
-    expect(await q.unconfirmedCount()).toBe(0);
   });
 });
 

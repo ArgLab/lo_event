@@ -8,6 +8,7 @@ import * as reduxLogger from '../src/reduxLogger.js';
 import { consoleLogger } from '../src/consoleLogger.js';
 import * as debug from '../src/debugLog.js';
 import { getBrowserInfo } from '../src/metadata/browserinfo.js';
+import * as disabler from '../src/disabler.js';
 
 const rl = reduxLogger.reduxLogger();
 
@@ -44,5 +45,25 @@ describe('loEvent testing', () => {
     expect(fields.source).toBe('org.ets.lo_event.test');
     expect(fields.version).toBe('1');
     expect(fields.preauth_type).toBe('test');
+  });
+
+  it('rejects application use of protocol-reserved frame names', () => {
+    expect(() => loEvent.logEvent('lock_fields', {})).toThrow(/reserved/);
+    expect(() => loEvent.logEvent('fetch_blob', {})).toThrow(/reserved/);
+  });
+
+  it('moves events through the front desk while transmission is blocked', async () => {
+    disabler.handleBlockError(new disabler.BlockError(
+      'retain locally',
+      'PERMANENT',
+      'MAINTAIN'
+    ));
+    loEvent.logEvent('blocked-admission', { marker: 99 });
+
+    let received;
+    do {
+      received = await reduxLogger.awaitEvent();
+    } while (received.event !== 'blocked-admission');
+    expect(received.marker).toBe(99);
   });
 });

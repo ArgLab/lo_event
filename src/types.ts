@@ -36,15 +36,40 @@ export type ReducerFn = (state: JSONObject, action: JSONObject) => JSONObject;
 export interface Logger {
   (event: string): void;
   init?: () => Promise<void> | void;
+  /** Called by lo_event.init before init(). Lets a logger derive stable storage
+   *  names from application identity without forcing every caller to repeat it. */
+  configure?: (context: { source: string }) => void;
   setField?: (data: string) => void;
   lo_name?: string;
   lo_id?: string;
   getLockFields?: () => Record<string, unknown> | null;
   /** Enqueued-but-unacked count (ack-aware loggers, e.g. websocketLogger). */
   unackedCount?: () => Promise<number> | number;
+  /** Ask (or re-ask) for the current state snapshot. */
+  requestState?: () => void;
   /** Console debug handles for this logger's durable queue, if it has one. */
   queueDebug?: QueueDebug;
 }
+
+/** The application chooses one delivery profile; it is never negotiated. */
+export interface DeliveryOptions {
+  /** false (default): confirm only on server ack. true: confirm after a send
+   *  accepted by a verified-open socket. */
+  autoack?: boolean;
+}
+
+/** Decisions emitted by the sans-I/O delivery engine. */
+export type Decision =
+  | { do: 'rewind' }
+  | { do: 'measureWatermark' }
+  | { do: 'probeQueue'; watermark: number }
+  | { do: 'sendFrame'; frame: string; seq: number }
+  | { do: 'confirmIds'; ids: number[] }
+  | { do: 'askForState'; frame: string }
+  | { do: 'pauseSending' }
+  | { do: 'resumeSending' }
+  | { do: 'discardOutbox' }
+  | { do: 'log'; level: 'info' | 'error'; message: string };
 
 /**
  * Metadata task descriptor — used in compileMetadata.
@@ -90,7 +115,7 @@ export interface QueueDebug {
 
 export interface QueueBackend {
   enqueue(item: unknown): void;
-  dequeue(): unknown | Promise<unknown>;
+  dequeue?(): unknown | Promise<unknown>;
   /** Next un-leased stored item (lowest seq), WITHOUT deleting it. Parks
    *  until an item is available. Advances an in-memory lease cursor. */
   leaseNext(): Promise<LeasedItem>;
@@ -133,15 +158,12 @@ export interface QueueBackend {
 /**
  * Configuration for the dequeue loop in queue.ts.
  *
- * Provide `onLease` for the ack-aware lease discipline (non-destructive,
- * confirm externally via Queue.confirm); otherwise `onDequeue` runs the
- * legacy destructive take.
+ * This loop belongs only to loEvent's in-memory front desk. The websocket
+ * adapter owns the outbox lease loop beside the socket it controls.
  */
 export interface DequeueLoopConfig {
   initialize?: () => Promise<boolean> | boolean;
-  shouldDequeue?: () => Promise<boolean> | boolean;
   onDequeue?: (item: unknown) => Promise<void> | void;
-  onLease?: (leased: LeasedItem) => Promise<void> | void;
   onError?: (message: string, error: unknown) => void;
 }
 
@@ -160,7 +182,6 @@ export interface InitOptions {
   debugLevel?: string;
   debugDest?: unknown[];
   useDisabler?: boolean;
-  queueType?: string;
   sendBrowserInfo?: boolean;
   verboseEvents?: boolean;
   metadata?: MetadataTask[];

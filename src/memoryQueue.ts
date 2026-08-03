@@ -18,7 +18,7 @@ interface Entry { seq: number; payload: unknown; }
 
 export class Queue {
   private items: Entry[];
-  private queueName: string;
+  private readonly queueName: string;
   private nextSeq: number;
   // Highest seq handed out by leaseNext() this session. leaseNext() returns
   // the lowest stored item with seq > leasedThrough; rewind() resets it so
@@ -55,22 +55,26 @@ export class Queue {
   }
 
   enqueue (item: unknown) {
-    const entry: Entry = { seq: this.nextSeq++, payload: item };
-    if (this.waiter) {
-      const w = this.waiter;
+    this.items.push({ seq: this.nextSeq++, payload: item });
+    this.wake();
+  }
+
+  /** Wake by re-running the queue's normal scan. Direct hand-off can advance a
+   * cursor past an older record and violates the shared backend contract. */
+  private wake () {
+    const waiter = this.waiter;
+    if (!waiter) return;
+    if (waiter.lease) {
+      const next = this.items.find(entry => entry.seq > this.leasedThrough);
+      if (!next) return;
       this.waiter = null;
-      if (w.lease) {
-        // Lease discipline: store it (confirm/rewind need it) AND hand it out.
-        this.items.push(entry);
-        this.leasedThrough = entry.seq;
-        w.resolve({ seq: entry.seq, item: entry.payload });
-      } else {
-        // Destructive discipline: hand straight to the waiter, don't store.
-        w.resolve(entry.payload);
-      }
+      this.leasedThrough = next.seq;
+      waiter.resolve({ seq: next.seq, item: next.payload });
       return;
     }
-    this.items.push(entry);
+    if (!this.items.length) return;
+    this.waiter = null;
+    waiter.resolve(this.items.shift()!.payload);
   }
 
   dequeue (): unknown | Promise<unknown> {
@@ -100,21 +104,8 @@ export class Queue {
   }
 
   rewind () {
-    // items are stored in ascending seq (enqueue appends increasing seq;
-    // confirm filters order-preservingly), so items[0] is the lowest — no need
-    // to scan/spread the whole array.
-    if (this.items.length === 0) { this.leasedThrough = 0; return; }
-    const first = this.items[0];
-    this.leasedThrough = first.seq - 1;
-    // If a lease consumer is parked (everything had been leased, nothing left
-    // to hand out), wake it with the earliest still-stored item so the resend
-    // starts immediately rather than waiting for a fresh enqueue.
-    if (this.waiter && this.waiter.lease) {
-      const w = this.waiter;
-      this.waiter = null;
-      this.leasedThrough = first.seq;
-      w.resolve({ seq: first.seq, item: first.payload });
-    }
+    this.leasedThrough = 0;
+    this.wake();
   }
 
   unconfirmedCount (): number {

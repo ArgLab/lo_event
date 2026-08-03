@@ -13,6 +13,7 @@ import type { Logger, MetadataTask } from './types.js';
 import type { LogDestination } from './debugLog.js';
 
 export const QueueType = Queue.QueueType;
+const RESERVED_EVENT_NAMES = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
 
 // We implement this as something like an FSM.
 const INIT_STATES = {
@@ -217,7 +218,6 @@ export function init (
     debugLevel = debug.LEVEL.NONE as string,
     debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
-    queueType = Queue.QueueType.AUTODETECT as string,
     sendBrowserInfo = false,
     verboseEvents = false,
     metadata = [] as MetadataTask[],
@@ -227,7 +227,9 @@ export function init (
   if (!version || typeof version !== 'string') throw new Error('version must be a non-null string');
 
   util.setVerboseEvents(verboseEvents);
-  queue = new Queue.Queue('LOEvent', { queueType });
+  // The front desk only preserves pre-go ordering. Durability belongs to each
+  // logger's outbox, so a second disk queue here would add a destructive hop.
+  queue = new Queue.Queue('LOEvent', { queueType: Queue.QueueType.IN_MEMORY });
 
   debug.setLevel(debugLevel);
   debug.setLogOutputs(debugDest);
@@ -236,6 +238,7 @@ export function init (
   }
 
   loggersEnabled = loggers;
+  loggersEnabled.forEach(logger => logger.configure?.({ source }));
   initialized = INIT_STATES.IN_PROGRESS;
   pendingSource = source;
   pendingVersion = version;
@@ -275,7 +278,6 @@ export function go () {
     initialized = INIT_STATES.READY;
     queue.startDequeueLoop({
       initialize: isInitialized,
-      shouldDequeue: disabler.retry,
       onDequeue: sendEvent
     });
   });
@@ -288,17 +290,19 @@ function sendEvent (event: unknown) {
       logger(jsonEncodedEvent);
     } catch (error) {
       if (error instanceof disabler.BlockError) {
-        // Handle BlockError exception here
         disabler.handleBlockError(error);
       } else {
-        // Other types of exceptions will propagate up
-        throw error;
+        // One logger must never cost its siblings their copy of an event.
+        debug.error(`Logger ${logger.lo_id ?? logger.lo_name ?? 'unnamed'} threw on an event`, error);
       }
     }
   }
 }
 
 export function logEvent (eventType: string, event: Record<string, unknown>) {
+  if (RESERVED_EVENT_NAMES.has(eventType)) {
+    throw new Error(`logEvent: '${eventType}' is a reserved protocol frame name`);
+  }
   // opt out / dead
   if (!disabler.storeEvents()) {
     return;
