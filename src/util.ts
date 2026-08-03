@@ -3,6 +3,13 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { storage } from './browserStorage.js';
 
+/** Application events share their `event` field with protocol frames. */
+const RESERVED_EVENT_NAMES = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
+
+export function isProtocolEventName (eventName: string): boolean {
+  return RESERVED_EVENT_NAMES.has(eventName);
+}
+
 /**
  * Helper function for copying specific field values
  * from a given source. This is called to collect browser

@@ -106,10 +106,13 @@ export class DeliveryEngine {
   }
 
   sendFailed (generation: number): Decision[] {
-    if (!this.isCurrent(generation) || !this.sending) return [];
-    const seq = this.currentSend?.seq;
+    if (!this.isCurrent(generation) || !this.sending || !this.currentSend) return [];
+    const { seq, eventId } = this.currentSend;
     this.sending = false;
     this.currentSend = null;
+    if (eventId !== null && this.inFlight.get(eventId) === seq) {
+      this.inFlight.delete(eventId);
+    }
     return [
       { do: 'log', level: 'error', message: `send of outbox record ${seq} failed; rewinding` },
       { do: 'rewind' }

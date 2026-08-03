@@ -154,16 +154,27 @@ export class Queue {
   }
 
   async unleasedAtOrBelow (seq: number): Promise<number> {
-    if (this.leasedThrough >= seq) return 0;
-    await this.writes;
-    const db = await this.ready;
-    const transaction = db.transaction(this.queueName, 'readonly');
-    const range = IDBKeyRange.bound(this.leasedThrough, seq, true, false);
-    const request = transaction.objectStore(this.queueName).count(range);
-    return await new Promise((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    // A failed send can rewind while this asynchronous count is in flight.
+    // Re-run against the new cursor rather than letting a pre-rewind zero clear
+    // the snapshot barrier with unsent backlog still present.
+    while (true) {
+      const epoch = this.leaseEpoch;
+      const leasedThrough = this.leasedThrough;
+      await this.writes;
+      if (epoch !== this.leaseEpoch) continue;
+      if (leasedThrough >= seq) return 0;
+
+      const db = await this.ready;
+      const transaction = db.transaction(this.queueName, 'readonly');
+      const range = IDBKeyRange.bound(leasedThrough, seq, true, false);
+      const request = transaction.objectStore(this.queueName).count(range);
+      const count = await new Promise<number>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      await transactionDone(transaction);
+      if (epoch === this.leaseEpoch) return count;
+    }
   }
 
   async inspect (limit = 20): Promise<unknown[]> {

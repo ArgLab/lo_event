@@ -66,6 +66,16 @@ describe('connection and confirmation', () => {
       .toContainEqual({ do: 'confirmIds', ids: [7] });
   });
 
+  it('a failed send removes its unsent identity from acknowledgement tracking', () => {
+    const engine = connectedEngine();
+    engine.recordLeased(7, 'browser.session.7', '{}');
+    expect(engine.awaitingAck()).toBe(1);
+
+    engine.sendFailed(engine.generation());
+    expect(engine.awaitingAck()).toBe(0);
+    expect(engine.ackReceived('browser.session.7')).toEqual([]);
+  });
+
   it('drains an unnamed legacy record loudly after send', () => {
     const decisions = send(connectedEngine(), 7, null);
     expect(pick(decisions, 'log')[0].level).toBe('error');

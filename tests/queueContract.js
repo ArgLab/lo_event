@@ -47,5 +47,17 @@ export function queueContract (label, createQueue) {
       await queue.leaseNext();
       expect(await queue.unleasedAtOrBelow(watermark)).toBe(0);
     });
+
+    it('clear removes records without reusing their storage ids', async () => {
+      const queue = createQueue('clear');
+      queue.enqueue('first');
+      queue.enqueue('second');
+      await queue.unconfirmedCount();
+      queue.clear();
+      await queue.unconfirmedCount();
+      queue.enqueue('third');
+
+      expect(await queue.maxSeq()).toBeGreaterThan(2);
+    });
   });
 }

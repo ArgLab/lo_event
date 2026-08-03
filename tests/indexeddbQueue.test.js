@@ -54,6 +54,18 @@ describe('IndexedDB outbox contract', () => {
     expect(await racingLease).toEqual({ seq: 1, item: 'first' });
   });
 
+  it('a rewind racing a barrier count cannot make the backlog look leased', async () => {
+    const queue = new Queue(name('barrier-rewind-race'));
+    queue.enqueue('first');
+    queue.enqueue('second');
+    await queue.leaseNext();
+    await queue.leaseNext();
+
+    const racingCount = queue.unleasedAtOrBelow(2);
+    queue.rewind();
+    expect(await racingCount).toBe(2);
+  });
+
   it('one sender cannot range-delete another sender\'s records', async () => {
     const database = name('explicit-confirm');
     const firstTab = new Queue(database);

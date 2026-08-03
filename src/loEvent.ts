@@ -13,7 +13,6 @@ import type { Logger, MetadataTask } from './types.js';
 import type { LogDestination } from './debugLog.js';
 
 export const QueueType = Queue.QueueType;
-const RESERVED_EVENT_NAMES = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
 
 // We implement this as something like an FSM.
 const INIT_STATES = {
@@ -300,7 +299,7 @@ function sendEvent (event: unknown) {
 }
 
 export function logEvent (eventType: string, event: Record<string, unknown>) {
-  if (RESERVED_EVENT_NAMES.has(eventType)) {
+  if (util.isProtocolEventName(eventType)) {
     throw new Error(`logEvent: '${eventType}' is a reserved protocol frame name`);
   }
   // opt out / dead

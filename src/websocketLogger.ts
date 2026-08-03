@@ -29,7 +29,6 @@ const SOCKET_OPEN = 1;
 const TICK_MS = 250;
 const RETRY_PAUSE_MS = 50;
 const FETCH_BLOB_FRAME = JSON.stringify({ event: 'fetch_blob' });
-const RESERVED_APPLICATION_EVENTS = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
 
 function defaultLocation (): Location {
   if (typeof window === 'undefined') throw new Error('A websocket URL is required outside a browser.');
@@ -409,7 +408,7 @@ export function websocketLogger (
   const logger = ((data: string) => {
     if (!disabler.storeEvents()) return;
     const frame = parseFrame(data);
-    if (RESERVED_APPLICATION_EVENTS.has(String(frame.event))) {
+    if (util.isProtocolEventName(String(frame.event))) {
       throw new Error(`Application event name is reserved: ${String(frame.event)}`);
     }
     outbox().enqueue(normalizedEvent(data));
