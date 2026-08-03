@@ -4,6 +4,17 @@ import { v4 as uuidv4 } from 'uuid';
 import { storage } from './browserStorage.js';
 
 /**
+ * Protocol frame names an application event may not use (§12 of
+ * docs/reliable-delivery.md): application events share the `event` field with
+ * protocol frames, so a same-named app event would be misparsed on every
+ * redelivery, forever. `lock_fields` is included because the logger
+ * constructs it. Both the front desk (loEvent.logEvent) and websocketLogger
+ * refuse these with a throw — a programming error in the caller, caught the
+ * first time the line runs.
+ */
+export const RESERVED_EVENT_NAMES = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
+
+/**
  * Helper function for copying specific field values
  * from a given source. This is called to collect browser
  * information if available.

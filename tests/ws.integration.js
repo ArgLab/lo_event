@@ -29,6 +29,12 @@ const wss = new WebSocketServer({ host, port });
 debug_log('WS test: Setting up connection');
 
 const dispatch = {
+  fetch_blob: function (event, ws) {
+    // The snapshot request — connection-scoped, answered on the socket that
+    // asked (§6). Reaches us only after the backlog (§7).
+    debug_log('WS test: Answering fetch_blob');
+    ws.send(JSON.stringify({ status: 'fetch_blob', data: {} }));
+  },
   terminate: function (event, ws) {
     debug_log('WS test: Terminating');
 
@@ -69,6 +75,13 @@ wss.on('connection', (ws) => {
     // Verify received data
     const j = JSON.parse(data.toString());
     debug_log('WS test: Dispatching: ', j);
+    // Ack by identity, like the real server: captured-to-log, idempotent —
+    // every received copy is acked, including duplicates (§4). Without this
+    // a durable client correctly holds every record forever.
+    const id = j?.metadata?.eventId;
+    if (id) {
+      ws.send(JSON.stringify({ status: 'ack', id }));
+    }
     dispatch[j.event](j, ws);
   });
 });

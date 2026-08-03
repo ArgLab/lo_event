@@ -8,6 +8,7 @@ export default defineConfig({
     consoleLogger: 'src/consoleLogger.ts',
     nullLogger: 'src/nullLogger.ts',
     websocketLogger: 'src/websocketLogger.ts',
+    protocol: 'src/protocol.ts',
     reduxLogger: 'src/reduxLogger.ts',
     browserEvents: 'src/browserEvents.ts',
     browserStorage: 'src/browserStorage.ts',

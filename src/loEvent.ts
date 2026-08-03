@@ -217,7 +217,6 @@ export function init (
     debugLevel = debug.LEVEL.NONE as string,
     debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
-    queueType = Queue.QueueType.AUTODETECT as string,
     sendBrowserInfo = false,
     verboseEvents = false,
     metadata = [] as MetadataTask[],
@@ -227,13 +226,23 @@ export function init (
   if (!version || typeof version !== 'string') throw new Error('version must be a non-null string');
 
   util.setVerboseEvents(verboseEvents);
-  queue = new Queue.Queue('LOEvent', { queueType });
+  // The front desk is the in-process hand-off buffer every event passes
+  // through on its way to the loggers. It is IN_MEMORY, explicitly and
+  // unconditionally (§5): the one durable store is the websocketLogger
+  // outbox, and autodetecting a second disk queue here put a destructive
+  // delete-on-read hop inside the §1 promise without adding durability.
+  queue = new Queue.Queue('LOEvent', { queueType: Queue.QueueType.IN_MEMORY });
 
   debug.setLevel(debugLevel);
   debug.setLogOutputs(debugDest);
   if (useDisabler) {
     currentState = currentState.then(() => disabler.init(useDisabler));
   }
+
+  // Hand loggers the application context before init(): ack-aware loggers
+  // namespace their durable store per app (§2), and `source` is the natural
+  // app id.
+  loggers.forEach(logger => logger.configure?.({ source }));
 
   loggersEnabled = loggers;
   initialized = INIT_STATES.IN_PROGRESS;
@@ -273,33 +282,40 @@ export function go () {
       return;
     }
     initialized = INIT_STATES.READY;
+    // No disabler gate here, deliberately (§5): nothing between logEvent()
+    // and the durable outbox may wait on the disabler. A blocked client
+    // keeps accepting and storing events; the block gates the SEND loop,
+    // inside websocketLogger. Gating this hop held events in a non-durable
+    // buffer through the block — a loss window if the tab closed.
     queue.startDequeueLoop({
       initialize: isInitialized,
-      shouldDequeue: disabler.retry,
       onDequeue: sendEvent
     });
   });
 }
 
+/** Fan an event out to every logger. One logger's failure is logged and
+ *  contained — it must not stop the fan-out or kill the loop (L17). */
 function sendEvent (event: unknown) {
   const jsonEncodedEvent = JSON.stringify(event);
   for (const logger of loggersEnabled) {
     try {
       logger(jsonEncodedEvent);
     } catch (error) {
-      if (error instanceof disabler.BlockError) {
-        // Handle BlockError exception here
-        disabler.handleBlockError(error);
-      } else {
-        // Other types of exceptions will propagate up
-        throw error;
-      }
+      debug.error(`Logger ${logger.lo_name ?? '(unnamed)'} failed to accept an event`, error);
     }
   }
 }
 
 export function logEvent (eventType: string, event: Record<string, unknown>) {
-  // opt out / dead
+  // A reserved name is a programming error in the caller: throw the first
+  // time the line runs, because a same-named app event would be misparsed as
+  // a protocol frame on every redelivery, forever (§12).
+  if (util.RESERVED_EVENT_NAMES.has(eventType)) {
+    throw new Error(`Event name is reserved by the delivery protocol: ${eventType}`);
+  }
+  // The privacy half of the disabler: under a DROP action we do not even
+  // store. (The network half — pausing sends — lives in websocketLogger.)
   if (!disabler.storeEvents()) {
     return;
   }

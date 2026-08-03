@@ -101,6 +101,31 @@ export function streamEvents () {
 }
 
 /**
+ * The block state as one unambiguous answer. Round one of the rebuild proved
+ * why this must be a single predicate rather than reconstructed from
+ * action/expiration at call sites: one build conflated "permanent" with
+ * "opt-out" and cleared durable unsent work on a permanent rate limit.
+ *
+ *   'clear'     — nothing engaged; send freely.
+ *   'temporary' — hold sending until the expiration passes (retry() waits it
+ *                 out); keep accepting and storing events (§5).
+ *   'permanent' — hold sending forever (e.g. MAINTAIN pending contract
+ *                 resolution); keep accepting and storing. Nothing is lost.
+ *   'opt-out'   — permanent + DROP: a privacy request. Stop storing AND
+ *                 discard the stored backlog — the single sanctioned
+ *                 deletion of unsent work (§5).
+ */
+export type BlockMode = 'clear' | 'temporary' | 'permanent' | 'opt-out';
+
+export function currentMode (): BlockMode {
+  if (action === DEFAULTS.action && !expiration) return 'clear';
+  if (expiration === TIME_LIMIT.PERMANENT) {
+    return action === EVENT_ACTION.DROP ? 'opt-out' : 'permanent';
+  }
+  return 'temporary';
+}
+
+/**
  * Determines if a client should retry based on the `expiration` status.
  * This function:
  * 1. Returns `false` if the expiration is permanent.

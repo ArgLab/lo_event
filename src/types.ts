@@ -37,11 +37,18 @@ export interface Logger {
   (event: string): void;
   init?: () => Promise<void> | void;
   setField?: (data: string) => void;
+  /** Called once by lo_event.init() before init(), with application context
+   *  (the app's `source`). Loggers that namespace durable stores per app use
+   *  it to derive a default namespace. */
+  configure?: (context: { source: string }) => void;
   lo_name?: string;
   lo_id?: string;
   getLockFields?: () => Record<string, unknown> | null;
   /** Enqueued-but-unacked count (ack-aware loggers, e.g. websocketLogger). */
   unackedCount?: () => Promise<number> | number;
+  /** Ask (or re-ask) the server for the state snapshot (§6). Re-arms the
+   *  ask-once latch; asking twice is free, never asking again is a hang. */
+  requestState?: () => void;
   /** Console debug handles for this logger's durable queue, if it has one. */
   queueDebug?: QueueDebug;
 }
@@ -90,7 +97,10 @@ export interface QueueDebug {
 
 export interface QueueBackend {
   enqueue(item: unknown): void;
-  dequeue(): unknown | Promise<unknown>;
+  /** Destructive take (delete-on-read). Only the front-desk buffer uses this
+   *  discipline; the durable outbox never does, so the IndexedDB backend does
+   *  not implement it (§5: one durable store, one read discipline). */
+  dequeue?(): unknown | Promise<unknown>;
   /** Next un-leased stored item (lowest seq), WITHOUT deleting it. Parks
    *  until an item is available. Advances an in-memory lease cursor. */
   leaseNext(): Promise<LeasedItem>;
@@ -131,17 +141,13 @@ export interface QueueBackend {
 }
 
 /**
- * Configuration for the dequeue loop in queue.ts.
- *
- * Provide `onLease` for the ack-aware lease discipline (non-destructive,
- * confirm externally via Queue.confirm); otherwise `onDequeue` runs the
- * legacy destructive take.
+ * Configuration for the front desk's destructive dequeue loop in queue.ts.
+ * (The durable outbox is driven by websocketLogger's lease loop instead —
+ * the two disciplines never share an instance.)
  */
 export interface DequeueLoopConfig {
   initialize?: () => Promise<boolean> | boolean;
-  shouldDequeue?: () => Promise<boolean> | boolean;
   onDequeue?: (item: unknown) => Promise<void> | void;
-  onLease?: (leased: LeasedItem) => Promise<void> | void;
   onError?: (message: string, error: unknown) => void;
 }
 
@@ -155,13 +161,41 @@ export interface StorageBackend {
 
 /**
  * Init options for lo_event.init().
+ *
+ * `queueType` is gone: the front desk is IN_MEMORY unconditionally (§5 — one
+ * durable store, the outbox; a second disk queue on the delivery path added a
+ * delete-on-read hop without adding durability). The outbox backend is a
+ * websocketLogger option.
  */
 export interface InitOptions {
   debugLevel?: string;
   debugDest?: unknown[];
   useDisabler?: boolean;
-  queueType?: string;
   sendBrowserInfo?: boolean;
   verboseEvents?: boolean;
   metadata?: MetadataTask[];
 }
+
+/** Options for the delivery engine (protocol.ts). */
+export interface DeliveryOptions {
+  /** false (default) = durable: confirm on server ack.
+   *  true = send-and-forget: confirm on a verified-OPEN send (§5). */
+  autoack?: boolean;
+}
+
+/**
+ * A decision returned by the delivery engine (protocol.ts) for the adapter
+ * (websocketLogger.ts) to perform. Decisions carry everything the adapter
+ * needs, so the adapter stays a pure executor (§9).
+ */
+export type Decision =
+  | { do: 'rewind' }
+  | { do: 'measureWatermark' }
+  | { do: 'probeQueue'; watermark: number }
+  | { do: 'sendFrame'; frame: string; seq: number }
+  | { do: 'confirmIds'; ids: number[] }
+  | { do: 'askForState'; frame: string }
+  | { do: 'pauseSending' }
+  | { do: 'resumeSending' }
+  | { do: 'clearQueue' }
+  | { do: 'log'; level: 'info' | 'error'; message: string };

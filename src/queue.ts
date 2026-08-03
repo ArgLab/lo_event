@@ -2,17 +2,17 @@ import * as indexeddbQueue from './indexeddbQueue.js';
 import * as memoryQueue from './memoryQueue.js';
 import * as debug from './debugLog.js';
 import * as util from './util.js';
-import type { QueueBackend, DequeueLoopConfig } from './types.js';
+import type { QueueBackend, DequeueLoopConfig, LeasedItem } from './types.js';
 
 export const QueueType = {
   AUTODETECT: 'AUTODETECT', // Persistent if available, otherwise in-memory
   IN_MEMORY: 'IN_MEMORY', // memoryQueue
-  PERSISTENT: 'PERSISTENT' // SQLite or IndexedDB. Raise an exception if not available.
+  PERSISTENT: 'PERSISTENT' // IndexedDB. Raise an exception if not available.
 } as const;
 
 const queueClasses: Record<string, new (name: string) => QueueBackend> = {
   [QueueType.IN_MEMORY]: memoryQueue.Queue,
-  [QueueType.PERSISTENT]: indexeddbQueue.Queue
+  [QueueType.PERSISTENT]: indexeddbQueue.Queue as unknown as new (name: string) => QueueBackend
 };
 
 function autodetect () {
@@ -48,8 +48,13 @@ export class Queue {
     this.queue.enqueue(item);
   }
 
+  /** Next un-leased stored item (lowest seq), WITHOUT deleting it (§3). */
+  leaseNext (): Promise<LeasedItem> {
+    return this.queue.leaseNext();
+  }
+
   /** Delete exactly the listed seqs — the ones THIS connection sent and saw
-   *  acked. Never a range: the store is shared across tabs. */
+   *  acked. Never a range: the store is shared across tabs (L1). */
   confirm (seqs: number[]) {
     this.queue.confirm(seqs);
   }
@@ -87,17 +92,19 @@ export class Queue {
   }
 
   /**
-   * This function starts a loop to continually
-   * dequeue items and process them appropriately
-   * based on provided functions.
+   * The front desk's hand-off loop: destructively dequeue items and hand each
+   * to onDequeue. Only the in-memory front desk uses this; the durable outbox
+   * is driven by websocketLogger's lease loop instead.
    */
   private async _startDequeueLoop ({
     initialize = async () => true,
-    shouldDequeue = async () => true,
     onDequeue = async (_item: unknown) => {},
-    onLease,
     onError = (message: string, error: unknown) => debug.error(message, error)
   }: DequeueLoopConfig = {}) {
+    if (!this.queue.dequeue) {
+      onError('QUEUE ERROR: This backend has no destructive dequeue; use the lease discipline.', null);
+      return;
+    }
     try {
       if (!await initialize()) {
         throw new Error('QUEUE ERROR: Initialization function returned false.');
@@ -109,37 +116,6 @@ export class Queue {
     debug.info('QUEUE: Dequeue loop initialized.');
 
     while (true) {
-      // Check if we are allowed to continue dequeueing.
-      // When shouldDequeue() returns false, we permanently terminate
-      // the loop. This is intentional — the primary caller is
-      // disabler.retry(), which only returns false for permanent
-      // opt-outs (e.g. student privacy requests). In that case,
-      // the loop must stop and must not restart. Temporary blocks
-      // (e.g. rate limits) are handled inside disabler.retry() by
-      // awaiting the expiration before returning true.
-      try {
-        if (!await shouldDequeue()) {
-          throw new Error('QUEUE ERROR: Dequeue streaming returned false.');
-        }
-      } catch (error) {
-        onError('QUEUE ERROR: Not allowed to start dequeueing', error);
-        return;
-      }
-
-      // Ack-aware lease discipline: hand the item to onLease WITHOUT deleting
-      // it. The consumer confirm()s it later (on server ack); rewind() re-hands
-      // unconfirmed items on reconnect. Nothing is lost if delivery fails.
-      if (onLease) {
-        try {
-          const leased = await this.queue.leaseNext();
-          await onLease(leased);
-        } catch (error) {
-          onError('QUEUE ERROR: Unable to lease/process item', error);
-        }
-        continue;
-      }
-
-      // Legacy destructive discipline: take-and-delete, then process.
       const item = await this.queue.dequeue();
       try {
         if (item !== null) {

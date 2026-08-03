@@ -45,4 +45,14 @@ describe('loEvent testing', () => {
     expect(fields.version).toBe('1');
     expect(fields.preauth_type).toBe('test');
   });
+
+  it('refuses reserved protocol event names with a throw (§12)', () => {
+    // An app event named like a protocol frame would be misparsed on every
+    // redelivery, forever. A throw is a programming error caught the first
+    // time the line runs; a silent drop is the one thing this library must
+    // not do.
+    expect(() => loEvent.logEvent('fetch_blob', {})).toThrow(/reserved/);
+    expect(() => loEvent.logEvent('save_blob', {})).toThrow(/reserved/);
+    expect(() => loEvent.logEvent('lock_fields', {})).toThrow(/reserved/);
+  });
 });
