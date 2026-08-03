@@ -21,6 +21,7 @@ class FakeWebSocket {
   sent = [];
   sentRaw = [];
   failSends = false;
+  deferClose = false;
 
   constructor () {
     FakeWebSocket.instances.push(this);
@@ -61,6 +62,14 @@ class FakeWebSocket {
 
   close () {
     if (this.readyState === 3) return;
+    if (this.deferClose) {
+      this.readyState = 2;
+      return;
+    }
+    this.finishClose();
+  }
+
+  finishClose () {
     this.readyState = 3;
     this.onclose?.({});
   }
@@ -272,6 +281,33 @@ describe('WebSocket adapter', () => {
     );
     const second = FakeWebSocket.instances.at(-1);
     await vi.waitFor(() => expect(second.sent.some(frame => frame.event === 'answer')).toBe(true));
+  });
+
+  it('reports a failed connection before its close event arrives', async () => {
+    const previousWindow = globalThis.window;
+    const eventTarget = new EventTarget();
+    const statuses = [];
+    globalThis.window = eventTarget;
+    eventTarget.addEventListener('lo_connection_status', event => {
+      statuses.push(event.detail.connected);
+    });
+
+    try {
+      const { logger, socket } = await connectedLogger({ fetchState: false });
+      await vi.waitFor(() => expect(statuses).toContain(true));
+      socket.deferClose = true;
+      socket.failSends = true;
+      logger(JSON.stringify({ event: 'answer', metadata: { eventId: 'answer' } }));
+
+      await vi.waitFor(() => expect(statuses.at(-1)).toBe(false));
+      expect(socket.readyState).toBe(2);
+      expect(await logger.unackedCount()).toBe(1);
+
+      socket.finishClose();
+    } finally {
+      if (previousWindow === undefined) delete globalThis.window;
+      else globalThis.window = previousWindow;
+    }
   });
 
   // This mutates module-global disabler state permanently, so it stays last.

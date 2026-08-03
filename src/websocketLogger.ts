@@ -131,6 +131,7 @@ export function websocketLogger (
   let initialization: Promise<void> | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let waitingOnDisabler = false;
+  let failCurrentConnection: (() => void) | null = null;
 
   /** External facts are reduced in arrival order. I/O answers start a new fact
    * instead of holding the serial lane, so a hung maxSeq cannot block elapsed()
@@ -182,10 +183,7 @@ export function websocketLogger (
             perform(engine.sendCompleted(generation));
           } else {
             perform(engine.sendFailed(generation));
-            // A socket that still reports OPEN but throws from send is not a
-            // useful retry target. Retire it so reconnect, not a hot lease
-            // loop, becomes the recovery path.
-            try { socket?.close(); } catch { /* close is best effort */ }
+            failCurrentConnection?.();
           }
           break;
         }
@@ -200,9 +198,7 @@ export function websocketLogger (
             perform(engine.stateSendCompleted(generation));
           } else {
             perform(engine.stateSendFailed(generation));
-            // A direct request has no durable retry carrier. Reconnect gives it
-            // a fresh connection latch and is safer than spinning on one socket.
-            try { socket?.close(); } catch { /* close is best effort */ }
+            failCurrentConnection?.();
           }
           break;
         }
@@ -293,18 +289,37 @@ export function websocketLogger (
       socket = candidate;
       let opened = false;
       let settled = false;
+      let invalidated = false;
 
       const finish = () => {
         if (settled) return;
         settled = true;
         if (attempt === socketAttempt) {
           stopTicker();
-          void submit(() => engine.disconnected());
-          util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
+          if (!invalidated) {
+            invalidated = true;
+            void submit(() => engine.disconnected());
+            util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
+          }
           if (socket === candidate) socket = null;
+          if (failCurrentConnection === fail) failCurrentConnection = null;
         }
         resolve(opened);
       };
+
+      const fail = () => {
+        if (attempt !== socketAttempt || invalidated) return;
+        invalidated = true;
+        stopTicker();
+        // Invalidate this connection synchronously. Waiting for the browser's
+        // close event would leave a window in which an already-computed queue
+        // probe could still be accepted under this connection's generation.
+        perform(engine.disconnected());
+        util.dispatchCustomEvent('lo_connection_status', { detail: { connected: false } });
+        try { candidate.close(); } catch { finish(); }
+      };
+
+      failCurrentConnection = fail;
 
       candidate.onopen = () => {
         if (attempt !== socketAttempt) return;

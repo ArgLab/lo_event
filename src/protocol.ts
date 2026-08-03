@@ -27,6 +27,7 @@ export class DeliveryEngine {
   private watermark: number | null = null;
   private barrierElapsed = 0;
   private probeElapsed = 0;
+  private lastUnleased: number | null = null;
 
   private snapshotFrame: string | null = null;
   private snapshotSending = false;
@@ -50,6 +51,7 @@ export class DeliveryEngine {
     this.watermark = null;
     this.barrierElapsed = 0;
     this.probeElapsed = 0;
+    this.lastUnleased = null;
     this.snapshotSending = false;
     this.snapshotSent = false;
     this.snapshotElapsed = 0;
@@ -135,13 +137,21 @@ export class DeliveryEngine {
     }
     this.watermark = maxSeq;
     this.barrier = 'pending';
+    this.barrierElapsed = 0;
     this.probeElapsed = 0;
+    this.lastUnleased = null;
     return [{ do: 'probeQueue', watermark: maxSeq }];
   }
 
   probeResult (generation: number, unleased: number): Decision[] {
     if (!this.isCurrent(generation) || this.barrier !== 'pending' || this.sending) return [];
-    if (unleased > 0) return [];
+    if (unleased > 0) {
+      if (this.lastUnleased !== null && unleased < this.lastUnleased) {
+        this.barrierElapsed = 0;
+      }
+      this.lastUnleased = unleased;
+      return [];
+    }
     this.barrier = 'clear';
     return this.askIfReady();
   }

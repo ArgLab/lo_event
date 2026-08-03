@@ -139,6 +139,33 @@ describe('flush barrier', () => {
     expect(decisions).toContainEqual({ do: 'askForState', frame: FETCH });
   });
 
+  it('a shrinking backlog holds the barrier open past the deadline', () => {
+    const engine = new DeliveryEngine();
+    engine.connected();
+    engine.requestState(FETCH);
+    expect(pick(engine.elapsed(BARRIER_DEADLINE_MS - 1), 'askForState')).toEqual([]);
+    const generation = engine.generation();
+    engine.watermarkResult(generation, 10);
+    engine.probeResult(generation, 10);
+
+    expect(pick(engine.elapsed(BARRIER_DEADLINE_MS - 1), 'askForState')).toEqual([]);
+    engine.probeResult(generation, 9);
+    expect(pick(engine.elapsed(BARRIER_DEADLINE_MS - 1), 'askForState')).toEqual([]);
+    expect(engine.barrierIsClear()).toBe(false);
+  });
+
+  it('a backlog that stops shrinking still opens at the deadline', () => {
+    const engine = new DeliveryEngine();
+    engine.connected();
+    engine.requestState(FETCH);
+    const generation = engine.generation();
+    engine.watermarkResult(generation, 10);
+    engine.probeResult(generation, 10);
+
+    expect(engine.elapsed(BARRIER_DEADLINE_MS))
+      .toContainEqual({ do: 'askForState', frame: FETCH });
+  });
+
   it('measurement failure opens loudly rather than hanging', () => {
     const engine = new DeliveryEngine();
     engine.connected();
