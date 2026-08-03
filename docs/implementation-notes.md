@@ -73,8 +73,8 @@ thing this build inherits, and each has a test named for it.
    for *any* permanent block, which is not the same question as "may I delete
    this user's unsent work?". Re-deriving that at the call site is how a
    permanent rate limit becomes silent data loss, which one rebuild shipped. The
-   distinction now lives in `disabler.isPermanentOptOut()` (DROP *and*
-   permanent), is passed to the engine as a fact, and is the only path to
+   distinction now lives in `disabler.currentMode()` — one predicate returning
+   `clear | temporary | permanent | opt-out` — and only `opt-out` reaches
    `clearOutbox`. *(websocketLogger.test.js: "a permanent rate limit stops
    sending WITHOUT deleting stored work")*
 3. **The barrier deadline runs in every non-clear state.** Scoping it to
@@ -119,6 +119,54 @@ thing this build inherits, and each has a test named for it.
 10. **Adapter-level tests exist at all.** Every defect above lived in the
     wiring, not in a decision core; a fake socket and a fake clock are what make
     that layer assertable.
+
+## Taken from the sibling round-2 builds
+
+`pmitros/2026-fable-protocol-a` and `pmitros/2026-sol-protocol-a` are
+independent builds of this spec from the same starting point. All three
+converged on the same architecture and the same round-1 fixes; these are the
+places where one of them was better, adopted here with a test each:
+
+- **A named three-way block mode** (fable). `disabler.currentMode()` replaces a
+  boolean, and the engine's `disablerEngaged(mode)` distinguishes *temporary*,
+  *permanent* and *opt-out*. The gain over "is it an opt-out?" is the middle
+  case: a permanent hold now **logs** that delivery has stopped for good, as an
+  engine decision a test can assert. A client that silently stops delivering
+  forever is L17's failure even though nothing is lost.
+- **A loud failed ask** (sol). `askFailed` returns a log decision rather than
+  re-arming silently.
+- **Elapsed time measured, not assumed** (sol). The ticker reports
+  `Date.now()` deltas instead of its nominal interval. Background tabs throttle
+  timers to minutes; an engine told "250 ms" forty times while four minutes
+  passed would hold its barrier deadline and snapshot re-ask open for the whole
+  throttled period.
+- **Identity stamped at admission** (fable, sol). A frame that arrives without
+  one is stamped at the door, so L7's accepted loss window covers genuinely
+  legacy stored records rather than anything a direct caller enqueues.
+- **`unleasedAtOrBelow` is epoch-checked** (fable), like `leaseNext`. A count
+  taken against a cursor that a rewind has since moved describes a world that
+  no longer exists, and a stale zero clears the flush barrier while the rewound
+  backlog is unsent.
+- **The preamble respects a DROP action** (sol): under a privacy opt-out the
+  metadata frame is not stored either.
+- **Two tests**: a block arriving while a lease sits parked (sol — the exact
+  race a round-1 build lost), and loEvent's fan-out contract, covering
+  `configure()` and sibling isolation when a logger throws (sol).
+
+Not adopted, deliberately:
+
+- **A serialized fact lane** (sol's `submit()`). It exists so that decisions
+  from concurrent facts cannot interleave. Here `apply()` is fully synchronous —
+  every asynchronous answer starts a *new* fact through `.then`, never a
+  suspended one — so no two decision lists can interleave, and a promise chain
+  would add latency without adding safety.
+- **A separate `snapshotSending`/`snapshotSent` pair** (sol). Equivalent in
+  practice to `asked` plus the tick-driven retry, and the tick version also
+  recovers if an adapter ever failed to report the send's outcome at all.
+- **Keeping the in-flight entry on a failed send** (fable). Both are sound —
+  storage ids are never reused, so a stale entry is harmless and a resend
+  re-registers the same mapping. Dropping it is one fewer thing in the map, and
+  it is what the test here pins.
 
 ## The metadata preamble (§5 step 2)
 

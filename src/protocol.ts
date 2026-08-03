@@ -66,13 +66,23 @@ export interface DeliveryOptions {
   autoack?: boolean;
 }
 
-/** Why sending is paused, as told to `disablerEngaged`. A permanent opt-out is
- *  the only block that may destroy stored work (§5) — every other block holds
- *  it. Keeping the distinction in the fact, rather than re-deriving it at each
- *  call site, is what stops "permanent" from quietly becoming "discard". */
-export interface BlockKind {
-  permanentOptOut?: boolean;
-}
+/**
+ * How a server block engages the disabler (§5, and the blocklist frame in §12):
+ *
+ *   'temporary' — a rate limit; sending pauses until the adapter reports
+ *                 `disablerReleased`. Admission continues throughout.
+ *   'permanent' — a permanent hold on transmission. Sending stops for good,
+ *                 events keep accumulating durably, and it says so: a silent
+ *                 permanent stall is exactly the failure L17 forbids.
+ *   'opt-out'   — a permanent privacy opt-out. Draining the stored backlog
+ *                 would violate it, so this is the single sanctioned deletion
+ *                 of unsent work (§5).
+ *
+ * The three are named here, in the fact, rather than reconstructed from a
+ * boolean at each call site: an earlier build reconstructed it wrongly and
+ * cleared durable unsent work on a permanent *rate limit*.
+ */
+export type DisablerMode = 'temporary' | 'permanent' | 'opt-out';
 
 export class DeliveryEngine {
   private readonly autoack: boolean;
@@ -330,10 +340,14 @@ export class DeliveryEngine {
    *  request for a full re-ask timeout: the latch exists to stop *bursts* of
    *  answered asks, not to ration attempts that never happened. */
   askFailed (gen: number): Decision[] {
-    if (gen !== this.gen) return [];
+    if (gen !== this.gen || !this.asked) return [];
     this.asked = false;
     this.sinceAsk = 0;
-    return [];
+    return [{
+      do: 'log',
+      level: 'error',
+      message: 'the state snapshot request did not reach an open socket; re-arming to ask again'
+    }];
   }
 
   private askIfReady (): Decision[] {
@@ -348,27 +362,33 @@ export class DeliveryEngine {
 
   /**
    * A blocklist frame, or a block already in effect: stop *sending*. Admission
-   * is untouched — a blocked client keeps accepting and storing events (§5).
-   *
-   * `permanentOptOut` is the one case that may destroy stored work: draining a
-   * backlog after a privacy opt-out would violate the opt-out, so this is the
-   * single sanctioned `clear()` of unsent work. Every other block — including a
-   * *permanent* rate limit — holds the queue instead. The caller states which
-   * this is; the engine never infers it from "permanent" alone.
+   * is untouched in every mode — a blocked client keeps accepting and storing
+   * events (§5); what varies is what happens to sending and to the stored
+   * backlog. See DisablerMode: only 'opt-out' may delete anything, and the
+   * engine never infers that from "permanent" alone.
    */
-  disablerEngaged ({ permanentOptOut = false }: BlockKind = {}): Decision[] {
+  disablerEngaged (mode: DisablerMode = 'temporary'): Decision[] {
     const out: Decision[] = [];
     if (!this.paused) {
       this.paused = true;
       out.push({ do: 'pauseSending' });
     }
-    if (permanentOptOut) {
+    if (mode === 'opt-out') {
       out.push({
         do: 'log',
         level: 'error',
-        message: 'permanent opt-out: discarding stored events and stopping delivery'
+        message: 'permanent opt-out: discarding the stored backlog on the user\'s instruction — the single sanctioned deletion of unsent work (§5)'
       });
       out.push({ do: 'clearOutbox' });
+    } else if (mode === 'permanent') {
+      // Loud, because the alternative is a client that quietly stops
+      // delivering forever while its queue grows: worse service is allowed,
+      // silence is not (L17).
+      out.push({
+        do: 'log',
+        level: 'error',
+        message: 'permanently blocked by the server; sending has stopped. Events keep accumulating durably and nothing is discarded'
+      });
     }
     return out;
   }

@@ -148,7 +148,7 @@ export function websocketLogger (
   let socket: WebSocket | null = null;
   let WSLibrary: new (url: string) => WebSocket;
   let ticker: ReturnType<typeof setInterval> | null = null;
-  let watchingDisabler = false;
+  let waitingOnDisabler = false;
   /** The session's locked context fields, replayed as a freshly stamped frame
    *  on every connection (§5 step 2). We keep the *fields*, never a stamped
    *  frame: an object that has ever carried an eventId is never enqueued again
@@ -323,7 +323,9 @@ export function websocketLogger (
   }
 
   function enqueueSessionMetadata () {
-    if (!Object.keys(lockedFields).length) return;
+    // A DROP action means "do not hold this user's data", which covers the
+    // metadata frame as much as any event — the same check logEvent() makes.
+    if (!disabler.storeEvents() || !Object.keys(lockedFields).length) return;
     // Copy first, then stamp: timestampEvent() writes into its argument, so
     // stamping the long-lived dict would burn one identity into every future
     // frame (L6). Every enqueue mints a fresh identity (L5).
@@ -369,7 +371,17 @@ export function websocketLogger (
 
   function startTicker () {
     if (ticker) return;
-    ticker = setInterval(() => apply(engine.elapsed(TICK_MS)), TICK_MS);
+    // Report the time that actually passed, not the interval we asked for.
+    // Background tabs throttle timers hard (minutes, not milliseconds), and an
+    // engine told "250ms" forty times when four minutes went by would hold its
+    // barrier deadline and snapshot re-ask open for the whole throttled period.
+    let last = Date.now();
+    ticker = setInterval(() => {
+      const now = Date.now();
+      const elapsed = Math.max(0, now - last);
+      last = now;
+      apply(engine.elapsed(elapsed));
+    }, TICK_MS);
     // Don't hold a Node process open for a heartbeat.
     (ticker as unknown as { unref?: () => void }).unref?.();
   }
@@ -403,8 +415,9 @@ export function websocketLogger (
         break;
 
       case 'blocklist':
+        debug.info('websocketLogger: blocked by the server; sending paused');
         disabler.handleBlockError(new disabler.BlockError(response.message, response.time_limit, response.action));
-        watchDisabler();
+        engageDisabler();
         break;
 
       case 'auth': {
@@ -444,43 +457,67 @@ export function websocketLogger (
   }
 
   /**
-   * Bring the engine in line with the disabler, and wait out any block.
+   * Bring the engine in line with the disabler.
    *
    * Called at startup (a block persisted in storage outlives the session that
-   * received it) and whenever a blocklist frame arrives. Sending stops;
-   * admission does not — a blocked client goes on accepting and storing events
-   * the whole time (§5).
-   *
-   * The *kind* of block is decided here, once, and handed to the engine.
-   * `disabler.retry()` answers "may I send yet?" and returns false for anything
-   * permanent, which is emphatically not the same question as "may I delete
-   * this student's unsent work?" — only a permanent opt-out says yes to that,
-   * and conflating the two is how a rate limit turns into data loss.
+   * received it) and whenever a blocklist frame arrives. Which kind of block
+   * this is comes from `disabler.currentMode()` — one predicate, in one place —
+   * and the engine owns what each kind does (§5). Sending stops; admission does
+   * not, in any mode.
    */
-  async function watchDisabler () {
-    if (watchingDisabler) return;
-    watchingDisabler = true;
+  function engageDisabler () {
+    const mode = disabler.currentMode();
+    if (mode === 'clear') return;
+    apply(engine.disablerEngaged(mode));
+    if (mode === 'temporary') awaitDisablerRelease();
+  }
+
+  /** Wait out a temporary block: `disabler.retry()` sleeps until the expiry and
+   *  returns true. A blocked client goes on accepting and storing events the
+   *  whole time — only sending is paused (§5). */
+  async function awaitDisablerRelease () {
+    if (waitingOnDisabler) return;
+    waitingOnDisabler = true;
     try {
-      while (!disabler.streamEvents()) {
-        apply(engine.disablerEngaged({ permanentOptOut: disabler.isPermanentOptOut() }));
-        if (!await disabler.retry()) {
-          debug.error('websocketLogger: permanently blocked by the server; sending has stopped');
-          return;                       // permanent: nothing to wait for
-        }
-      }
-      apply(engine.disablerReleased());
+      if (await disabler.retry()) apply(engine.disablerReleased());
     } finally {
-      watchingDisabler = false;
+      waitingOnDisabler = false;
     }
   }
 
   // ──────────────────────────────────────────────────── the logger surface
 
-  /** Admission: straight to the outbox. Nothing here may wait on connection
-   *  state, a server response, or the disabler (§5). */
+  /**
+   * Admission: straight to the outbox. Nothing here may wait on connection
+   * state, a server response, or the disabler (§5).
+   *
+   * A frame arriving without an identity is stamped at the door rather than
+   * admitted unnamed. Everything from `lo_event.logEvent()` is already stamped;
+   * this covers a caller wiring the logger up directly. It matters because an
+   * unnamed record can never be acked, so L7 drains it best-effort — an
+   * accepted loss window, and one worth confining to genuinely legacy records
+   * in the store rather than opening for new writes.
+   */
   const wsLogData = function (data: string) {
-    store().enqueue(data);
+    store().enqueue(named(data));
   } as Logger;
+
+  /** `data` if it already carries an identity; a stamped copy if it does not.
+   *  Never re-stamps: a resend of a stored record reuses its identity (L6). */
+  function named (data: string): string {
+    if (eventIdOf(data) !== null) return data;
+    try {
+      const frame = JSON.parse(data) as Record<string, unknown>;
+      util.timestampEvent(frame);
+      return JSON.stringify(frame);
+    } catch {
+      // Unparseable: store it as it came. It cannot be named, so L7 drains it
+      // best-effort and says so — which is the honest outcome for a payload we
+      // cannot read.
+      debug.error('websocketLogger: could not parse a frame to stamp it; storing it unnamed');
+      return data;
+    }
+  }
 
   wsLogData.lo_name = 'Websocket Logger';
   wsLogData.lo_id = 'websocket_logger';
@@ -513,7 +550,7 @@ export function websocketLogger (
       WSLibrary = WebSocket;
     }
 
-    watchDisabler();                                 // a block may predate this session
+    engageDisabler();                                // a block may predate this session
     connectionLoop();
     leaseLoop();
     if (fetchState) wsLogData.requestState!();
@@ -524,7 +561,7 @@ export function websocketLogger (
   wsLogData.setField = function (data: string) {
     const frame = JSON.parse(data);
     util.mergeDictionary(lockedFields, (frame.fields ?? {}) as Record<string, unknown>);
-    store().enqueue(data);
+    store().enqueue(named(data));
   };
 
   /** Zero means every event has been durably acknowledged — the precise "is

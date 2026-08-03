@@ -200,9 +200,12 @@ describe('a lease that cannot be sent is released, not stranded (L13, §3)', () 
   });
 
   it('rewinds instead of sending while the disabler is engaged (§5)', () => {
+    // Including the case that broke an earlier build: the block arrived while
+    // a lease sat parked, so the record surfaced *after* the pause. The check
+    // is at the moment the record surfaces, not the moment it was requested.
     const engine = new DeliveryEngine();
     connectedWithEmptyStore(engine);
-    engine.disablerEngaged();
+    engine.disablerEngaged('temporary');
 
     expect(kinds(engine.recordLeased(4, 'id-4', 'frame'))).toEqual(['rewind']);
   });
@@ -233,26 +236,40 @@ describe('the disabler gates sending, never admission (§5)', () => {
     const engine = new DeliveryEngine();
     connectedWithEmptyStore(engine);
 
-    expect(kinds(engine.disablerEngaged())).toContain('pauseSending');
+    expect(kinds(engine.disablerEngaged('temporary'))).toContain('pauseSending');
     expect(kinds(engine.disablerReleased())).toContain('resumeSending');
   });
 
   it('a connection opened while blocked does not resume sending', () => {
     const engine = new DeliveryEngine();
-    engine.disablerEngaged();
+    engine.disablerEngaged('temporary');
 
     expect(kinds(engine.connected())).not.toContain('resumeSending');
   });
 
   it('clears the outbox ONLY for a permanent opt-out', () => {
-    // The single sanctioned deletion of unsent work (§5). A permanent *rate
-    // limit* is not an opt-out: deleting there would be the unforgivable
-    // category, reached through a plausible-looking code path.
-    const rateLimited = new DeliveryEngine();
-    expect(kinds(rateLimited.disablerEngaged({ permanentOptOut: false }))).not.toContain('clearOutbox');
+    // The single sanctioned deletion of unsent work (§5). Neither a temporary
+    // nor a *permanent* rate limit is an opt-out: deleting for either would be
+    // the unforgivable category, reached through a plausible-looking path.
+    const temporary = new DeliveryEngine();
+    expect(kinds(temporary.disablerEngaged('temporary'))).not.toContain('clearOutbox');
+
+    const permanent = new DeliveryEngine();
+    expect(kinds(permanent.disablerEngaged('permanent'))).not.toContain('clearOutbox');
 
     const optedOut = new DeliveryEngine();
-    expect(kinds(optedOut.disablerEngaged({ permanentOptOut: true }))).toContain('clearOutbox');
+    expect(kinds(optedOut.disablerEngaged('opt-out'))).toContain('clearOutbox');
+  });
+
+  it('says so when a block is permanent — a silent forever-stall is not allowed', () => {
+    // Sending stops for good and the queue grows without bound. That is the
+    // correct behavior, and it must be visible: worse service is permitted,
+    // silence is not (L17).
+    const permanent = new DeliveryEngine();
+    expect(kinds(permanent.disablerEngaged('permanent'))).toContain('log');
+
+    const temporary = new DeliveryEngine();
+    expect(kinds(temporary.disablerEngaged('temporary'))).not.toContain('log');
   });
 });
 
@@ -470,8 +487,9 @@ describe('the state snapshot (§6, L11)', () => {
     const engine = new DeliveryEngine();
     engine.requestState(FRAME);
     connectedWithEmptyStore(engine);
-    engine.askFailed(engine.generation());
 
+    // Loudly: an ask that never left is a degradation like any other (L17).
+    expect(kinds(engine.askFailed(engine.generation()))).toContain('log');
     expect(only(engine.elapsed(1), 'askForState')).toEqual([{ do: 'askForState', frame: FRAME }]);
   });
 });

@@ -26,7 +26,8 @@ class FakeSocket {
   constructor (url) {
     this.url = url;
     this.readyState = 0;      // CONNECTING
-    this.sent = [];
+    this.sent = [];           // parsed frames
+    this.sentRaw = [];        // exactly what went on the wire
     FakeSocket.instances.push(this);
   }
 
@@ -40,7 +41,10 @@ class FakeSocket {
   send (data) {
     if (this.readyState !== 1) throw new Error('send on a socket that is not OPEN');
     if (FakeSocket.failSendFor.has(this.url)) throw new Error('simulated send failure');
-    this.sent.push(JSON.parse(String(data)));
+    this.sentRaw.push(String(data));
+    // Unparseable payloads reach the wire too (L7); keep them out of `sent`
+    // rather than letting the fake socket be stricter than a real one.
+    try { this.sent.push(JSON.parse(String(data))); } catch { /* see sentRaw */ }
   }
 
   /** A server → client frame. */
@@ -207,17 +211,38 @@ describe('send-and-forget delivery', () => {
 });
 
 describe('unnamed records (L7)', () => {
-  it('drains best-effort rather than resending forever', async () => {
-    // No metadata.eventId: the server cannot name it in an ack, so waiting for
-    // one means resending it on every reconnect until the end of time.
+  it('stamps an unnamed frame at admission rather than storing it unackable', async () => {
+    // Everything from logEvent() is already stamped; a caller wiring the
+    // logger up directly is not. Stamping at the door keeps L7's accepted loss
+    // window for genuinely legacy records instead of opening it for new writes.
     const { websocketLogger } = await freshModules();
     const { logger, latest } = await startLogger(websocketLogger);
     const socket = latest();
     socket.open();
 
-    logger(JSON.stringify({ event: 'legacy-leftover' }));
-    await vi.waitFor(() => expect(socket.events()).toContain('legacy-leftover'));
+    logger(JSON.stringify({ event: 'unstamped', value: 1 }));
+    await vi.waitFor(() => expect(socket.events()).toContain('unstamped'));
+
+    const frame = socket.sent.find(sent => sent.event === 'unstamped');
+    expect(frame.metadata?.eventId).toEqual(expect.any(String));
+    // And it now behaves like any named record: held until its ack.
+    expect(await logger.unackedCount()).toBe(1);
+    socket.deliver({ status: 'ack', id: frame.metadata.eventId });
     await vi.waitFor(async () => expect(await logger.unackedCount()).toBe(0));
+  });
+
+  it('drains a stored record that cannot be named, best-effort', async () => {
+    // A payload that does not parse cannot be stamped and can never be acked,
+    // so waiting for one means resending it on every reconnect until the end of
+    // time. It goes out once, is confirmed on send, and says so.
+    const { websocketLogger } = await freshModules();
+    const { logger, latest } = await startLogger(websocketLogger);
+    const socket = latest();
+    socket.open();
+
+    logger('{ this is not valid json');
+    await vi.waitFor(async () => expect(await logger.unackedCount()).toBe(0));
+    expect(socket.sentRaw).toContain('{ this is not valid json');
   });
 });
 
@@ -388,6 +413,29 @@ describe('the disabler gates sending, never storing (§5)', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
 
     expect(await logger.unackedCount()).toBe(1);      // held, not discarded
+  });
+
+  it('a block arriving while a lease is parked stops that record too', async () => {
+    // The race an earlier build lost: the disabler was checked before leasing,
+    // so a lease that was already parked resolved *after* the block landed and
+    // went straight out. The check has to be at the moment the record
+    // surfaces, which is why the engine — not the loop — decides.
+    const { websocketLogger } = await freshModules();
+    const { logger, latest } = await startLogger(websocketLogger);
+    const socket = latest();
+    socket.open();
+    await vi.waitFor(() => expect(socket.events()).toContain('fetch_blob'));
+    // The lease loop is now parked on an empty outbox.
+
+    socket.deliver({ status: 'blocklist', message: 'slow down', time_limit: 'DAYS', action: 'MAINTAIN' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // This enqueue wakes the parked lease. The record must not go out.
+    logger(JSON.stringify({ event: 'woke-the-lease', metadata: { eventId: 'id-p' } }));
+    await new Promise(resolve => setTimeout(resolve, 60));
+
+    expect(socket.events()).not.toContain('woke-the-lease');
+    expect(await logger.unackedCount()).toBe(1);
   });
 
   it('a permanent opt-out discards the backlog — the one sanctioned clear()', async () => {

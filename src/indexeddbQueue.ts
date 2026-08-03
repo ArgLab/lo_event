@@ -233,13 +233,24 @@ export class Queue {
   /** Stored records in (leasedThrough, seq] — the barrier question itself. Only
    *  the store can answer it: another context can send-and-delete records this
    *  instance never leases, so no local send tally would do (§7). */
-  unleasedAtOrBelow (seq: number): Promise<number> {
-    if (this.leasedThrough >= seq) return Promise.resolve(0);   // IDBKeyRange.bound needs a non-empty range
-    return this.run<number>('readonly', (store, _transaction, resolve, reject) => {
-      const request = store.count(IDBKeyRange.bound(this.leasedThrough, seq, true, false));
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+  async unleasedAtOrBelow (seq: number): Promise<number> {
+    // Epoch-checked like leaseNext, and for the same reason: a count is taken
+    // against the cursor as it was when the transaction opened. A rewind
+    // landing before it resolves means the answer describes a cursor that no
+    // longer exists — and a stale zero clears the flush barrier while the
+    // rewound backlog is still unsent, which is the ordering §7 exists to
+    // prevent. Re-count instead.
+    while (true) {
+      const epoch = this.cursorEpoch;
+      const from = this.leasedThrough;
+      if (from >= seq) return 0;             // IDBKeyRange.bound needs a non-empty range
+      const count = await this.run<number>('readonly', (store, _transaction, resolve, reject) => {
+        const request = store.count(IDBKeyRange.bound(from, seq, true, false));
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      if (epoch === this.cursorEpoch) return count;
+    }
   }
 
   /** DEBUG: the first `limit` stored records, without leasing or deleting —
