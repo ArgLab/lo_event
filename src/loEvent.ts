@@ -217,7 +217,6 @@ export function init (
     debugLevel = debug.LEVEL.NONE as string,
     debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
-    queueType = Queue.QueueType.AUTODETECT as string,
     sendBrowserInfo = false,
     verboseEvents = false,
     metadata = [] as MetadataTask[],
@@ -227,7 +226,12 @@ export function init (
   if (!version || typeof version !== 'string') throw new Error('version must be a non-null string');
 
   util.setVerboseEvents(verboseEvents);
-  queue = new Queue.Queue('LOEvent', { queueType });
+  // The front desk is IN_MEMORY, explicitly (§5). It is a hand-off buffer
+  // between logEvent() and the loggers, not a durable store — and in a browser
+  // an autodetected backend would make it a *second* IndexedDB store on the
+  // delivery path: a destructive delete-on-read hop inside §1's promise that
+  // adds no durability. One durable store, the outbox.
+  queue = new Queue.Queue('LOEvent', { queueType: Queue.QueueType.IN_MEMORY });
 
   debug.setLevel(debugLevel);
   debug.setLogOutputs(debugDest);
@@ -236,6 +240,11 @@ export function init (
   }
 
   loggersEnabled = loggers;
+  // Loggers are constructed before init() runs, so the application's identity
+  // reaches them here. A durable logger needs it to namespace its store: two
+  // apps on one origin otherwise share an outbox and drain each other's
+  // records (§2).
+  loggers.forEach(logger => logger.configure?.({ source, version }));
   initialized = INIT_STATES.IN_PROGRESS;
   pendingSource = source;
   pendingVersion = version;
@@ -273,9 +282,15 @@ export function go () {
       return;
     }
     initialized = INIT_STATES.READY;
+    // No disabler gate here. Rate limits and blocklists gate the SEND stage,
+    // inside the durable loggers, *after* the outbox commit (§5): a blocked
+    // client keeps accepting and storing events and merely stops sending them.
+    // Gating here would hold events in this in-memory buffer for the length of
+    // the block — outside §1's promise, and lost if the tab closes. The
+    // privacy half of the disabler (a DROP action refusing to store at all)
+    // lives in logEvent() below, where it belongs.
     queue.startDequeueLoop({
       initialize: isInitialized,
-      shouldDequeue: disabler.retry,
       onDequeue: sendEvent
     });
   });
@@ -284,21 +299,29 @@ export function go () {
 function sendEvent (event: unknown) {
   const jsonEncodedEvent = JSON.stringify(event);
   for (const logger of loggersEnabled) {
+    // A throwing logger must not cost its siblings their copy of the event.
     try {
       logger(jsonEncodedEvent);
     } catch (error) {
-      if (error instanceof disabler.BlockError) {
-        // Handle BlockError exception here
-        disabler.handleBlockError(error);
-      } else {
-        // Other types of exceptions will propagate up
-        throw error;
-      }
+      debug.error(`Logger ${logger.lo_id ?? logger.lo_name ?? 'unnamed'} threw on an event`, error);
     }
   }
 }
 
+/**
+ * Protocol frame names. Application events share the `event` field with the
+ * protocol, and an app event named like a protocol frame would be misparsed on
+ * every redelivery, forever — so the client refuses to enqueue one (§12).
+ */
+const RESERVED_EVENTS = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
+
 export function logEvent (eventType: string, event: Record<string, unknown>) {
+  if (RESERVED_EVENTS.has(eventType)) {
+    // Throwing rather than dropping: it is a caller bug, caught the first time
+    // the line runs, and silently dropping an event is the one thing this
+    // library must not do.
+    throw new Error(`logEvent: '${eventType}' is a reserved protocol frame name; pick another event type`);
+  }
   // opt out / dead
   if (!disabler.storeEvents()) {
     return;

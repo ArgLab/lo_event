@@ -12,10 +12,9 @@ import {
   getSaveStatus,
   getConnected,
   getLoaded,
-  getFatal,
 } from './reduxLogger.js';
 
-export type { SaveStatus, FatalState } from './reduxLogger.js';
+export type { SaveStatus } from './reduxLogger.js';
 
 /**
  * Whether the current state has been persisted.
@@ -49,15 +48,9 @@ export function useLoaded() {
   return useSyncExternalStore(subscribeStatus, getLoaded, () => false);
 }
 
-/**
- * Sticky fatal condition surfaced by a logger, or null when none.
- *
- *   { code: 'ACK_REQUIRED', message } — a requireAck client hit a server that
- *     doesn't support the ack protocol (mis-deploy; work may not be saved).
- *
- * Reactive — read it alongside useConnected/useSaved to render a banner.
- * Sticky until the logger clears it (e.g. a late ack-capable hello recovers).
- */
-export function useFatal() {
-  return useSyncExternalStore(subscribeStatus, getFatal, () => null);
-}
+// There is no useFatal(). It existed for one condition — a `requireAck` client
+// that discovered, at runtime, that the server did not support acks — and both
+// the option and the runtime discovery are gone (§5): the profile is
+// configuration now, so the mis-deploy it guarded against presents as a queue
+// that only grows, visible in unackedCount() and loDebug.queue(). Loud,
+// recoverable, and never a silent loss.

@@ -44,6 +44,17 @@ export interface Logger {
   unackedCount?: () => Promise<number> | number;
   /** Console debug handles for this logger's durable queue, if it has one. */
   queueDebug?: QueueDebug;
+  /**
+   * Called by lo_event.init() with the application's identity, before any
+   * event flows. A durable logger uses `source` to namespace its outbox: the
+   * store is shared by everything on the origin that names it, so two apps
+   * that share an origin must not share one (§2). Loggers are constructed
+   * before init() runs, which is why this is a hook rather than a constructor
+   * argument.
+   */
+  configure?: (identity: { source: string; version: string }) => void;
+  /** Ask (or re-ask) the server for the state snapshot (§6). */
+  requestState?: () => void;
 }
 
 /**
@@ -90,7 +101,12 @@ export interface QueueDebug {
 
 export interface QueueBackend {
   enqueue(item: unknown): void;
-  dequeue(): unknown | Promise<unknown>;
+  /** Destructive take (delete-on-read). Optional, and deliberately so: only
+   *  the in-memory backend implements it, because the only consumer is
+   *  loEvent's front desk — a hand-off buffer, not a store. The durable outbox
+   *  has exactly one read discipline, the lease, so an event can never be
+   *  deleted merely by being read (§5). */
+  dequeue?(): unknown | Promise<unknown>;
   /** Next un-leased stored item (lowest seq), WITHOUT deleting it. Parks
    *  until an item is available. Advances an in-memory lease cursor. */
   leaseNext(): Promise<LeasedItem>;
@@ -131,17 +147,19 @@ export interface QueueBackend {
 }
 
 /**
- * Configuration for the dequeue loop in queue.ts.
+ * Configuration for the front desk's destructive loop in queue.ts.
  *
- * Provide `onLease` for the ack-aware lease discipline (non-destructive,
- * confirm externally via Queue.confirm); otherwise `onDequeue` runs the
- * legacy destructive take.
+ * There is no lease variant here: the outbox's lease loop lives in
+ * websocketLogger, next to the socket it sends on, because deciding what to do
+ * with a leased record is a protocol decision and this file is plumbing (§9).
  */
 export interface DequeueLoopConfig {
   initialize?: () => Promise<boolean> | boolean;
+  /** A false answer terminates the loop permanently, so only wire this to a
+   *  condition that means "never again". In particular NOT the disabler: that
+   *  would gate events before the durable write (§5). */
   shouldDequeue?: () => Promise<boolean> | boolean;
   onDequeue?: (item: unknown) => Promise<void> | void;
-  onLease?: (leased: LeasedItem) => Promise<void> | void;
   onError?: (message: string, error: unknown) => void;
 }
 

@@ -101,6 +101,21 @@ export function streamEvents () {
 }
 
 /**
+ * Is this a permanent opt-out — a request to stop holding this user's data at
+ * all, rather than a block on transmitting it?
+ *
+ * This is the ONLY condition under which stored, unsent events may be deleted
+ * (§5 of docs/reliable-delivery.md). It is a separate question from `retry()`,
+ * which returns false for *any* permanent block: a permanent rate limit says
+ * "stop sending", never "destroy the work". Deriving one from the other at each
+ * call site is how a rate limit becomes silent data loss, so the distinction
+ * lives here, named, and is asked for explicitly.
+ */
+export function isPermanentOptOut () {
+  return action === EVENT_ACTION.DROP && expiration === TIME_LIMIT.PERMANENT;
+}
+
+/**
  * Determines if a client should retry based on the `expiration` status.
  * This function:
  * 1. Returns `false` if the expiration is permanent.

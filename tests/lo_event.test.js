@@ -45,4 +45,15 @@ describe('loEvent testing', () => {
     expect(fields.version).toBe('1');
     expect(fields.preauth_type).toBe('test');
   });
+
+  it('refuses to log an event named like a protocol frame (§12)', () => {
+    // Application events share the `event` field with the protocol. An app
+    // event called `save_blob` would be misparsed by the server on every
+    // redelivery, forever. Throwing (rather than dropping) is deliberate: it
+    // is a caller bug, caught the first time the line runs, and silently
+    // dropping an event is the one thing this library must not do.
+    expect(() => loEvent.logEvent('save_blob', {})).toThrow(/reserved/);
+    expect(() => loEvent.logEvent('fetch_blob', {})).toThrow(/reserved/);
+    expect(() => loEvent.logEvent('lock_fields', {})).toThrow(/reserved/);
+  });
 });

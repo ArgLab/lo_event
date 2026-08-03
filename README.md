@@ -111,11 +111,12 @@ bottom is hard**:
 1. **Capture (hard).** `logEvent → durable queue`, unconditionally. No gate,
    failure, disconnect, or disabled-UX state may stop an event that reached
    `lo_event` from being enqueued.
-2. **Transmission (soft).** The capability gate and ack lease decide *when* to
-   send and *when to delete* — only once the server durably logs it (the ack).
-   Un-acked events sit durably and resend on reconnect. Nothing is dropped, only
-   deferred.
-3. **UX (soft).** Hooks (`useConnected`, `useFatal`, …) let the app
+2. **Transmission (soft).** The lease discipline decides *when* to send and
+   *when to delete* — only once the server durably logs it (the ack). Un-acked
+   events sit durably and resend on reconnect. Rate limits and blocklists gate
+   this layer, never layer 1: a blocked client keeps accepting and storing.
+   Nothing is dropped, only deferred.
+3. **UX (soft).** Hooks (`useConnected`, `useSaved`, …) let the app
    disable the interface. Presentation only — never a reason an event
    isn't captured -- but the goal is to be able to stop sending events
    if we lost connection (tell the user we're not connected). Of
@@ -135,36 +136,51 @@ outages — events persist across a page reload or process restart. The
 in-process outages and reconnects, but not a reload/restart. Reliability rests
 on a **lease discipline**, not delete-on-read:
 
-- Every event gets a **monotonic `seq`** (the queue's autoIncrement id, durable
-  across reloads). `seq` is a **reserved** top-level transport field — don't use
-  it as an application event field; the ack protocol sets it and the server acks
-  against it.
-- **Lease, don't take:** `leaseNext()` hands an item to the sender without
-  deleting it; `confirm(uptoSeq)` deletes cumulatively, only once the server acks
-  that seq; `rewind()` re-hands everything un-acked on reconnect.
-- The server acks `{ status: 'ack', seq }` **after durably writing** to its log.
-  Cumulative: "have everything ≤ seq."
-- **At-least-once, not exactly-once.** Duplicates are harmless (every field
-  update carries an absolute last-write-wins value), so we resend freely rather
-  than risk loss.
+- Every record has a **storage id** (the queue's autoIncrement key), local to
+  this browser's queue and never put on the wire, and an **event identity**
+  (`metadata.eventId`), which is what the server acks and what dedup keys on.
+- **Lease, don't take:** `leaseNext()` hands a record to the sender without
+  deleting it; `confirm(ids)` deletes **exactly the named ids**; `rewind()`
+  re-hands everything unconfirmed on reconnect.
+- The server acks `{ status: 'ack', id }` **after durably writing** to its log,
+  naming the event identity, and acks every copy it receives — including
+  duplicates of an identity it already has.
+- **Never a cumulative delete.** The store is shared across tabs, and each tab
+  acks over its own socket, so "delete everything ≤ n" deletes records other
+  tabs enqueued and nobody has sent. Duplicates are covered by at-least-once
+  delivery; deletions are not.
+- **At-least-once, not exactly-once.** Duplicates are harmless (the server folds
+  events through idempotent, order-tolerant reducers), so we resend freely
+  rather than risk loss.
 
 Why it exists: the old queue deleted an event in the same transaction it read it
 for sending, and `socket.send()` is fire-and-forget — so an event closed-tab in
 that window vanished silently (we measured real tail-of-session losses). The
 lease discipline closes that window.
 
-**Capability negotiation.** On connect the server may send
-`{ status: 'hello', capabilities: { ack: true } }` first. Ack mode engages only
-when advertised; against servers that never say hello, behavior is byte-identical
-legacy send-and-delete. Resolution is a **gate**, not a flag: the client holds
-sends until the mode is known (a `hello`, or a short grace timeout → legacy), so
-the open→hello window can't send the resend backlog in the wrong mode.
+**Two profiles, one flag.** Who signs for a sent record is **configuration, not
+negotiation** — `autoack` on the logger:
 
-**`requireAck`.** A client that *requires* durability (e.g. lo-blocks) sets this.
-If the server doesn't advertise `ack`, the client **fails loudly and refuses
-legacy** — silently running ack-less would lose data, which is the exact bug.
-(writing_observer and other ack-less consumers leave it off and keep the legacy
-fallback.)
+- `autoack: false` (default, *durable*) — a record is deleted only when the
+  server acks it. This is what lo-blocks uses.
+- `autoack: true` (*send-and-forget*) — the client confirms each record to
+  itself the moment a send goes out on a socket verified OPEN. For high-volume
+  observational telemetry, where the accepted loss window is "the socket
+  buffered it and then the connection died."
+
+Both profiles run the same pipeline; the flag changes only who signs and when.
+There is no runtime handshake to discover the server's dialect: client and
+server deployments are coordinated, and a misconfigured pair is *visible* — a
+durable client against a server that never acks confirms nothing, so the queue
+grows, `unackedCount()` climbs and `loDebug.queue()` shows the backlog. Loud and
+recoverable, never a silent loss. (An earlier design negotiated this per
+connection with a `hello` frame, a grace timer and a `requireAck` escape hatch;
+the guessing is where the bugs lived. Do not reintroduce it.)
+
+**The state snapshot** (`fetch_blob`) is a request/response, not an event: it is
+never queued, is re-asked on each new connection while unanswered, and waits
+for the connection-start backlog to be sent first, so a recovered tail of
+work cannot be overwritten by a snapshot that predates it.
 
 ## Client state-sync (the redux workflow)
 
@@ -201,7 +217,6 @@ consumers stay reactive without an imperative `consumeCustomEvent` listener.
 | `useConnected()` | `true \| false \| null` | connected / offline / no websocket configured |
 | `useSaved()` | `'saved' \| 'modified' \| 'error'` | persistence status |
 | `useLoaded()` | `boolean` | initial state resolved (gate the UI on this) |
-| `useFatal()` | `{ code, message } \| null` | sticky fatal (e.g. `ACK_REQUIRED`); render a banner |
 
 ## Failure handling
 
@@ -214,9 +229,14 @@ When something fails in a way worth noticing, log to **all three** of:
    ring-buffered, so it can never grow toward the quota. Deliberately **not**
    wired to every `debug.error` — call it only for failures worth persisting, or
    you get exponentially growing logs.
-3. **A consumer surface** — a reactive hook (e.g. `useFatal`) so the app can tell
-   the user. Prefer this to throwing: throwing from the logging path endangers
-   delivery to sibling loggers (see *The delivery standard*).
+3. **A consumer surface** — a reactive hook (e.g. `useConnected`, `useSaved`) so
+   the app can tell the user. Prefer this to throwing: throwing from the logging
+   path endangers delivery to sibling loggers (see *The delivery standard*).
+
+Degradations follow one rule: fail toward **worse service**, never toward
+silent loss and never toward a hang. An unreadable queue costs a stale
+snapshot; an unackable frame drains best-effort and says so; a server that
+stops acking leaves the queue holding work and warns.
 
 ## Installation
 
@@ -244,7 +264,9 @@ import { websocketLogger } from 'lo_event/websocket';
 //    for occasional events, …).
 lo_event.init('my-app', '1.0.0', [
   consoleLogger(),
-  websocketLogger('wss://example.org/wsapi/in/', { requireAck: true }),
+  // Durable by default: records are deleted only when the server acks them.
+  // Pass { autoack: true } for send-and-forget telemetry.
+  websocketLogger('wss://example.org/wsapi/in/'),
 ]);
 
 // 2. Optional: lock in context that rides the header — sent once, denormalized
@@ -263,8 +285,8 @@ lo_event.logEvent('SUBMIT', { problem: 'q1', correct: true });
 The order matters: `init` → any pre-auth `lockFields` → `go` → `logEvent`.
 Events logged before `go()` don't get dropped — they queue durably and stream
 once `go()` runs. And every `logEvent` lands in the **durable queue first**; the
-websocket logger streams it and (in ack mode) holds it until the server
-confirms, so a reload or outage doesn't lose it. That's what "tries very hard
+websocket logger streams it and (in the durable profile) holds it until the
+server confirms, so a reload or outage doesn't lose it. That's what "tries very hard
 never to lose an event" means in practice — see *The delivery standard* and
 *Durability & the ack protocol*.
 

@@ -2,7 +2,7 @@ import * as indexeddbQueue from './indexeddbQueue.js';
 import * as memoryQueue from './memoryQueue.js';
 import * as debug from './debugLog.js';
 import * as util from './util.js';
-import type { QueueBackend, DequeueLoopConfig } from './types.js';
+import type { QueueBackend, DequeueLoopConfig, LeasedItem } from './types.js';
 
 export const QueueType = {
   AUTODETECT: 'AUTODETECT', // Persistent if available, otherwise in-memory
@@ -86,18 +86,34 @@ export class Queue {
     this.queue.clear();
   }
 
+  /** Next stored record, without deleting it (§3). The outbox's only read
+   *  discipline; the lease loop that drives it lives in websocketLogger, next
+   *  to the socket it sends on. */
+  leaseNext (): Promise<LeasedItem> {
+    return this.queue.leaseNext();
+  }
+
   /**
-   * This function starts a loop to continually
-   * dequeue items and process them appropriately
-   * based on provided functions.
+   * The front desk's loop: take an item, delete it, hand it on.
+   *
+   * Destructive by design and used in exactly one place — loEvent's in-process
+   * buffer between logEvent() and the loggers, which is a hand-off, not a
+   * store (§5). The outbox never dequeues destructively: an event deleted on
+   * read is an event that exists only in a local variable, which is where §1's
+   * promise goes to die.
    */
   private async _startDequeueLoop ({
     initialize = async () => true,
     shouldDequeue = async () => true,
     onDequeue = async (_item: unknown) => {},
-    onLease,
     onError = (message: string, error: unknown) => debug.error(message, error)
   }: DequeueLoopConfig = {}) {
+    const dequeue = this.queue.dequeue?.bind(this.queue);
+    if (!dequeue) {
+      onError('QUEUE ERROR: this backend is lease-only and has no destructive dequeue',
+        new Error('lease-only backend'));
+      return;
+    }
     try {
       if (!await initialize()) {
         throw new Error('QUEUE ERROR: Initialization function returned false.');
@@ -109,14 +125,11 @@ export class Queue {
     debug.info('QUEUE: Dequeue loop initialized.');
 
     while (true) {
-      // Check if we are allowed to continue dequeueing.
-      // When shouldDequeue() returns false, we permanently terminate
-      // the loop. This is intentional — the primary caller is
-      // disabler.retry(), which only returns false for permanent
-      // opt-outs (e.g. student privacy requests). In that case,
-      // the loop must stop and must not restart. Temporary blocks
-      // (e.g. rate limits) are handled inside disabler.retry() by
-      // awaiting the expiration before returning true.
+      // A false answer here terminates the loop permanently, so anything wired
+      // to it must mean "never again", not "not right now". Nothing in
+      // lo_event passes it today: gating this hop would hold events in memory,
+      // *before* the durable write, which is the one place a gate must never
+      // be (§5).
       try {
         if (!await shouldDequeue()) {
           throw new Error('QUEUE ERROR: Dequeue streaming returned false.');
@@ -126,21 +139,7 @@ export class Queue {
         return;
       }
 
-      // Ack-aware lease discipline: hand the item to onLease WITHOUT deleting
-      // it. The consumer confirm()s it later (on server ack); rewind() re-hands
-      // unconfirmed items on reconnect. Nothing is lost if delivery fails.
-      if (onLease) {
-        try {
-          const leased = await this.queue.leaseNext();
-          await onLease(leased);
-        } catch (error) {
-          onError('QUEUE ERROR: Unable to lease/process item', error);
-        }
-        continue;
-      }
-
-      // Legacy destructive discipline: take-and-delete, then process.
-      const item = await this.queue.dequeue();
+      const item = await dequeue();
       try {
         if (item !== null) {
           await onDequeue(item);
