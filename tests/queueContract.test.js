@@ -89,6 +89,21 @@ function contractSuite (backendName, makeQueue) {
       expect(await parked).toEqual({ seq: 1, item: 'a' });
     });
 
+    it('REGRESSION: an enqueue-then-rewind in one tick hands the parked consumer the post-rewind lowest, not the waker', async () => {
+      // The socket-open sequence: the metadata preamble is enqueued, then
+      // rewind() runs (§5 step order). A consumer parked with the previous
+      // connection's cursor must not be handed the preamble ahead of the
+      // recovered backlog — a wake that reads the cursor before the rewind
+      // jumps the backlog and double-sends the waker.
+      const q = makeQueue();
+      q.enqueue('backlog');
+      await q.leaseNext();                   // previous connection sent it…
+      const parked = q.leaseNext();          // …and parked, cursor at 1
+      q.enqueue('preamble');                 // wake — with a stale cursor
+      q.rewind();                            // same tick: the new connection's rewind
+      expect(await parked).toEqual({ seq: 1, item: 'backlog' });
+    });
+
     it('maxSeq is the highest stored id, or null when empty (§7 watermark)', async () => {
       const q = makeQueue();
       expect(await q.maxSeq()).toBe(null);

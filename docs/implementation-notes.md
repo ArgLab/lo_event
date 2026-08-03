@@ -94,6 +94,56 @@ Additions and changes:
   a round-one build gated `fetch_blob` responses on the current socket and
   paid an extra 10s re-ask for a resolution the spec accepts.
 
+## Adopted from cross-review of the sibling round-2 builds
+
+After the three round-2 builds were complete, each was adversarially reviewed
+and good ideas were shared. This build adopted:
+
+- **The `retry()` re-read loop** (from the sol build): `disabler.retry()`
+  re-reads block state after every sleep instead of resetting
+  unconditionally. Without it, a blocklist frame arriving while an earlier
+  temporary block was being waited out — including a permanent privacy
+  opt-out — was erased when the stale wait expired, and sending resumed
+  through it. The adapter's release path re-checks `currentMode()` in a loop
+  for the same reason (a block landing between retry() resolving and the
+  release being applied would otherwise bounce off the single-flight guard
+  with nobody waiting on it). Both are pinned by REGRESSION tests in
+  `tests/disabler.test.js`, mutation-checked to fail against the unfixed
+  code.
+- **`askFailed(gen)` as a fact, plus the tick as the recovery path for an
+  owed-but-not-outstanding ask** (from the opus build): a snapshot ask whose
+  direct send fails re-arms the latch immediately and retries on the next
+  tick — one tick of delay instead of the full 10s re-ask timeout. The latch
+  exists to stop bursts of answered asks, not to ration attempts that never
+  happened.
+- **Close a socket whose OPEN-state send throws** (from the opus build):
+  otherwise the lease loop retries against a broken-but-OPEN socket forever,
+  loudly but pointlessly; closing hands recovery to the reconnect loop.
+- **An honest tick** (from the opus review's findings): the ticker reports
+  measured `Date.now()` deltas, not its nominal 250ms period — background-tab
+  timer throttling would otherwise stretch the barrier deadline and re-ask
+  timeout arbitrarily.
+- **Idempotent `init()`** (same source): a second `init()` must not spawn a
+  second connection loop and lease loop against one engine.
+- **Deferred re-scan wake in memoryQueue** (from the opus build's review of
+  this tree): the socket-open sequence enqueues the metadata preamble and
+  then rewinds (§5 step order), so a consumer parked with the previous
+  connection's cursor must be woken by a scan that runs AFTER the rewind —
+  or the preamble jumps the recovered backlog and is sent twice (benign
+  under L3, but wasteful and against §5's ordering). The wake defers one
+  microtask and re-scans; the IndexedDB backend already had this property
+  structurally. Pinned by the enqueue-then-rewind contract test, which the
+  memory backend fails without the deferral.
+
+One reviewer note declined: the round-2 sol review flagged this tree's
+`unleasedAtOrBelow` zero fast path as vulnerable to the stale-count race. In
+this adapter the lease→send→fail→rewind sequence is a single synchronous
+block and probes are issued (and the fast-path value computed) only outside
+it, so the stale schedule is not reachable; the async count path is
+epoch-guarded. The invariant is: probes are computed at consistent cursor
+moments, which holds as long as the adapter's send path stays synchronous —
+noted here so a future async refactor knows what it is breaking.
+
 ## Timings
 
 | constant | value | spec |

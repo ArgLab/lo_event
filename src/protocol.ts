@@ -312,6 +312,18 @@ export class DeliveryEngine {
     return [];
   }
 
+  /** The ask could not be put on the wire (the socket closed between the
+   *  decision and its execution). Re-arm immediately rather than holding the
+   *  request for a full re-ask timeout: the latch exists to stop *bursts* of
+   *  answered asks, not to ration attempts that never happened. The next
+   *  tick's `elapsed` retries it. */
+  askFailed (gen: number): Decision[] {
+    if (gen !== this.gen) return [];
+    this.asked = false;
+    this.sinceAsk = 0;
+    return [];
+  }
+
   private askIfReady (): Decision[] {
     if (!this.online || !this.request || this.asked) return [];
     if (this.barrier !== 'clear') return [];   // un-evaluated refuses to send
@@ -388,12 +400,20 @@ export class DeliveryEngine {
       }
     }
 
-    if (this.request && this.asked) {
-      this.sinceAsk += ms;
-      if (this.sinceAsk >= ASK_TIMEOUT_MS) {
-        this.asked = false;      // re-arm the latch and ask again, loudly
-        out.push({ do: 'log', level: 'error', message: 'no answer to the state snapshot request; asking again' });
+    if (this.request) {
+      if (!this.asked) {
+        // Owed but not outstanding: an earlier ask failed to reach the wire
+        // (askFailed), or the barrier cleared with no other trigger. The tick
+        // is the single recovery path, so a failed ask costs one tick, not a
+        // full re-ask timeout.
         out.push(...this.askIfReady());
+      } else {
+        this.sinceAsk += ms;
+        if (this.sinceAsk >= ASK_TIMEOUT_MS) {
+          this.asked = false;      // re-arm the latch and ask again, loudly
+          out.push({ do: 'log', level: 'error', message: 'no answer to the state snapshot request; asking again' });
+          out.push(...this.askIfReady());
+        }
       }
     }
     return out;

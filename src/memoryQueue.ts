@@ -81,23 +81,33 @@ export class Queue {
   }
 
   /** Re-run the scan for whoever is parked. The store is the only authority
-   *  on "next" — the waker is never handed around it (§3). */
+   *  on "next" — the waker is never handed around it (§3).
+   *
+   *  The scan is deferred a microtask so it reads the cursor AFTER any
+   *  same-tick follow-up: at socket open the metadata preamble is enqueued
+   *  and then rewind() runs (§5 step order), and a consumer parked with the
+   *  previous connection's cursor must be handed the post-rewind lowest
+   *  record — the recovered backlog — not the preamble that woke it. (The
+   *  IndexedDB backend gets this for free: its wake re-runs an async scan
+   *  that resolves after the rewind anyway.) */
   private wake () {
-    if (this.parkedDequeue) {
-      if (this.items.length === 0) return;
-      const resolve = this.parkedDequeue;
-      this.parkedDequeue = null;
-      resolve((this.items.shift() as Entry).payload);
-      return;
-    }
-    if (this.parkedLease) {
-      const next = this.items.find(e => e.seq > this.leasedThrough);
-      if (!next) return;
-      const resolve = this.parkedLease;
-      this.parkedLease = null;
-      this.leasedThrough = next.seq;
-      resolve({ seq: next.seq, item: next.payload });
-    }
+    queueMicrotask(() => {
+      if (this.parkedDequeue) {
+        if (this.items.length === 0) return;
+        const resolve = this.parkedDequeue;
+        this.parkedDequeue = null;
+        resolve((this.items.shift() as Entry).payload);
+        return;
+      }
+      if (this.parkedLease) {
+        const next = this.items.find(e => e.seq > this.leasedThrough);
+        if (!next) return;
+        const resolve = this.parkedLease;
+        this.parkedLease = null;
+        this.leasedThrough = next.seq;
+        resolve({ seq: next.seq, item: next.payload });
+      }
+    });
   }
 
   unconfirmedCount (): number {

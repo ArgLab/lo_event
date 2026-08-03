@@ -299,6 +299,27 @@ describe('the snapshot latch (§6, L11)', () => {
     const engine = connectedEmpty();   // barrier cleared before anyone asked
     expect(of(engine.requestState(FETCH), 'askForState')).toHaveLength(1);
   });
+
+  it('an ask that never reached the wire re-arms and retries on the next tick, not after the full timeout', () => {
+    // The latch exists to stop bursts of ANSWERED asks, not to ration
+    // attempts that never happened: a failed direct send costs one tick.
+    const engine = connectedEmpty();
+    engine.requestState(FETCH);                    // asked…
+    engine.askFailed(engine.generation());         // …but the send failed
+    expect(of(engine.elapsed(1), 'askForState')).toHaveLength(1);
+  });
+
+  it('a stale-generation askFailed is ignored', () => {
+    const engine = connectedEmpty();
+    engine.requestState(FETCH);
+    const staleGen = engine.generation();
+    engine.stateReceived();                        // answered on this connection
+    engine.disconnected();
+    engine.connected();
+    engine.watermarkResult(engine.generation(), null);
+    engine.askFailed(staleGen);                    // old connection's failure report
+    expect(of(engine.elapsed(1), 'askForState')).toHaveLength(0);   // nothing owed
+  });
 });
 
 describe('the disabler (§5)', () => {

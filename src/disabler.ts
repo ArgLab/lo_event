@@ -133,14 +133,19 @@ export function currentMode (): BlockMode {
  *    initializations), and then returns `true` to allow a retry.
  */
 export async function retry () {
-  if (expiration === TIME_LIMIT.PERMANENT) {
-    return false;
-  }
-  const now = Date.now();
-  if (now < expiration!) {
-    debug.info(`waiting for expiration to happen ${new Date(expiration!).toString()}`);
-    await util.delay(expiration! - now);
-    debug.info('we are done waiting');
+  while (true) {
+    if (expiration === TIME_LIMIT.PERMANENT) {
+      return false;
+    }
+    const deadline = expiration;
+    const now = Date.now();
+    if (deadline === null || now >= deadline) break;
+    debug.info(`waiting for expiration to happen ${new Date(deadline).toString()}`);
+    await util.delay(deadline - now);
+    // A later blocklist frame may have extended the block — or upgraded it to
+    // permanent — while we slept. Re-read the CURRENT state rather than
+    // clearing that newer instruction: resetting unconditionally here is how
+    // a permanent privacy opt-out delivered mid-wait got silently erased.
   }
   action = DEFAULTS.action;
   expiration = DEFAULTS.expiration;

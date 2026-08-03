@@ -198,12 +198,15 @@ export function websocketLogger (
           outbox().confirm(decision.ids);
           break;
 
-        case 'askForState':
+        case 'askForState': {
           // Directly on the socket, never through the queue: the answer is
           // worthless to another tab and garbage once this session dies (§6).
-          // A failed send is harmless — the ask timeout re-asks.
-          sendNow(decision.frame);
+          // A failed send re-arms the latch via askFailed, and the next tick
+          // retries — one tick of delay, not a full re-ask timeout.
+          const gen = engine.generation();
+          if (!sendNow(decision.frame)) apply(engine.askFailed(gen));
           break;
+        }
 
         case 'pauseSending':
           gate.set(false);
@@ -240,7 +243,12 @@ export function websocketLogger (
       socket.send(frame);
       return true;
     } catch (error) {
-      debug.error('websocketLogger: socket send failed', error);
+      // A send that throws while the socket still claims OPEN is a broken
+      // socket. Close it so the reconnect loop replaces it — otherwise the
+      // lease loop (and the snapshot retry) would spin against it forever,
+      // loudly but pointlessly.
+      debug.error('websocketLogger: send failed on an OPEN socket; closing it for a reconnect', error);
+      try { socket.close(); } catch { /* already closing */ }
       return false;
     }
   }
@@ -357,7 +365,17 @@ export function websocketLogger (
 
   function startTicker () {
     if (ticker) return;
-    ticker = setInterval(() => apply(engine.elapsed(TICK_MS)), TICK_MS);
+    // Report REAL elapsed time, not the interval's nominal period: background
+    // tabs throttle timers (to 1s, or 1/min), and a fixed 250ms per fire
+    // would stretch the barrier deadline and the re-ask timeout arbitrarily.
+    // The engine treats time as a fact; feed it an honest one.
+    let last = Date.now();
+    ticker = setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - last;
+      last = now;
+      apply(engine.elapsed(elapsed));
+    }, TICK_MS);
     // Don't hold a Node process open for a heartbeat.
     (ticker as unknown as { unref?: () => void }).unref?.();
   }
@@ -457,13 +475,29 @@ export function websocketLogger (
 
   /** Wait out a temporary block. `disabler.retry()` sleeps until the expiry
    *  and returns true. A blocked client goes on accepting and storing events
-   *  the whole time — only sending stops (§5). */
+   *  the whole time — only sending stops (§5).
+   *
+   *  The loop, and the mode re-check, close a race: a new blocklist frame can
+   *  land between retry() resolving and the release being applied — and its
+   *  own awaitDisablerRelease() call would bounce off the waitingOnDisabler
+   *  guard, leaving nobody waiting on it. Re-checking the mode makes this
+   *  waiter pick the new block up instead of releasing through it. */
   async function awaitDisablerRelease () {
     if (waitingOnDisabler) return;
     waitingOnDisabler = true;
-    const mayResume = await disabler.retry();
-    waitingOnDisabler = false;
-    if (mayResume) apply(engine.disablerReleased());
+    try {
+      while (true) {
+        const mayResume = await disabler.retry();
+        if (!mayResume) return;               // permanent: sending stays paused
+        if (disabler.currentMode() === 'clear') {
+          apply(engine.disablerReleased());
+          return;
+        }
+        // A newer block landed while releasing; loop and wait that one out.
+      }
+    } finally {
+      waitingOnDisabler = false;
+    }
   }
 
   // ──────────────────────────────────────────────────── the logger surface
@@ -509,7 +543,10 @@ export function websocketLogger (
     appNamespace = source;
   };
 
-  wsLogData.init = async function () {
+  // Idempotent: a second init() must not spawn a second connection loop and
+  // lease loop against the same engine (interleaved generations, double
+  // sends). loEvent calls it once, but the surface is public.
+  wsLogData.init = util.once(async function () {
     try {
       const stored = await new Promise<Record<string, unknown>>(resolve => storage.get('lo_server', resolve as never));
       if (stored?.lo_server) {
@@ -534,7 +571,7 @@ export function websocketLogger (
     connectionLoop();
     leaseLoop();
     if (fetchState) wsLogData.requestState!();
-  };
+  });
 
   /** Context fields locked for the session. The frame loEvent stamped is
    *  enqueued as-is; the *fields* are kept for the per-connection replay. */
