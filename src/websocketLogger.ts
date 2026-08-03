@@ -174,9 +174,15 @@ export function websocketLogger (
 
         case 'sendFrame': {
           const generation = engine.generation();
-          perform(sendNow(decision.frame)
-            ? engine.sendCompleted(generation)
-            : engine.sendFailed(generation));
+          if (sendNow(decision.frame)) {
+            perform(engine.sendCompleted(generation));
+          } else {
+            perform(engine.sendFailed(generation));
+            // A socket that still reports OPEN but throws from send is not a
+            // useful retry target. Retire it so reconnect, not a hot lease
+            // loop, becomes the recovery path.
+            try { socket?.close(); } catch { /* close is best effort */ }
+          }
           break;
         }
 
@@ -230,11 +236,16 @@ export function websocketLogger (
       try {
         await gate.wait();
         if (stopped) return;
+        const leaseGeneration = engine.generation();
         const { seq, item } = await outbox().leaseNext();
         const frame = typeof item === 'string' ? item : JSON.stringify(item);
         let rewound = false;
         await submit(() => {
-          const decisions = engine.recordLeased(seq, eventIdOf(item), frame);
+          // A lease may have been parked since the previous connection. Its
+          // cursor observation is stale even if a new socket is now online.
+          const decisions: Decision[] = leaseGeneration === engine.generation()
+            ? engine.recordLeased(seq, eventIdOf(item), frame)
+            : [{ do: 'rewind' }];
           rewound = decisions.some(decision => decision.do === 'rewind');
           return decisions;
         });

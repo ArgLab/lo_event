@@ -15,6 +15,7 @@ class FakeWebSocket {
   onerror = null;
   onmessage = null;
   sent = [];
+  failSends = false;
 
   constructor () {
     FakeWebSocket.instances.push(this);
@@ -26,6 +27,7 @@ class FakeWebSocket {
 
   send (data) {
     if (this.readyState !== 1) throw new Error('socket is not open');
+    if (this.failSends) throw new Error('simulated send failure');
     const frame = JSON.parse(String(data));
     this.sent.push(frame);
     if (frame.event === 'fetch_blob' && FakeWebSocket.answerSnapshots) {
@@ -112,6 +114,49 @@ describe('WebSocket adapter', () => {
     expect(events.indexOf('recovered-answer')).toBeLessThan(events.indexOf('fetch_blob'));
   });
 
+  it('releases a lease parked on the previous connection before sending the new preamble', async () => {
+    const { logger, socket: first } = await connectedLogger({ fetchState: false });
+    logger.setField(JSON.stringify({
+      event: 'lock_fields',
+      fields: { source: 'test-app' },
+      metadata: { eventId: 'initial-lock' }
+    }));
+    logger(JSON.stringify({ event: 'answer', metadata: { eventId: 'answer' } }));
+    await vi.waitFor(() => expect(first.sent.some(frame => frame.event === 'answer')).toBe(true));
+
+    first.close();
+    await vi.waitFor(
+      () => expect(FakeWebSocket.instances.at(-1)).not.toBe(first),
+      { timeout: 4000 }
+    );
+    const second = FakeWebSocket.instances.at(-1);
+    await vi.waitFor(() => expect(second.sent.some(frame => frame.event === 'answer')).toBe(true));
+
+    expect(second.sent.map(frame => frame.event)).toEqual([
+      'lock_fields',
+      'answer',
+      'lock_fields'
+    ]);
+  });
+
+  it('retires an OPEN socket whose send throws, then retries on a new connection', async () => {
+    const { logger, socket: first } = await connectedLogger({ fetchState: false });
+    first.failSends = true;
+    logger(JSON.stringify({ event: 'answer', metadata: { eventId: 'answer' } }));
+
+    await vi.waitFor(() => expect(first.readyState).toBe(3));
+    expect(first.sent).toEqual([]);
+    expect(await logger.unackedCount()).toBe(1);
+
+    await vi.waitFor(
+      () => expect(FakeWebSocket.instances.at(-1)).not.toBe(first),
+      { timeout: 4000 }
+    );
+    const second = FakeWebSocket.instances.at(-1);
+    await vi.waitFor(() => expect(second.sent.some(frame => frame.event === 'answer')).toBe(true));
+  });
+
+  // This mutates module-global disabler state permanently, so it stays last.
   it('a block arriving while leaseNext is parked prevents the next record from sending', async () => {
     const { logger, socket } = await connectedLogger({ fetchState: false });
     // The drain loop is parked on an empty queue at this point.
