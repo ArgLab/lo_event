@@ -1,389 +1,219 @@
-/**
- * This files functions as a Queue using an indexeddb backend.
- *
- * If we are operating in a browser environment, we will use
- * the built-in indexeddb. In node environments, we will use
- * packages that mirror the functionality of indexeddb.
- *
- * Each item can be added to the end of the queue with `enqueue(item)`.
- * Items can be retrieved from the queue with `item = await dequeue()`.
- *
- * TODO
- * This code works in the browser, but breaks in a node environment.
- * autoIncrement is NOT supported when working in the node
- * environment. We will likely need to make some form of wrapper
- * to achieve this behavior for node.
- * See https://github.com/metagriffin/indexeddb-js/blob/master/src/indexeddb-js.js#L418C1-L418C53
- * NOTE: When we had our own counter for the id, we did notice that the node
- * environment (indexeddb-js or sqlite3) handled keys differently, thus
- * returning items out of order.
- *
- * TODO: This needs a very good code review. We weren't able to do
- * this before merge.
- */
 import * as debug from './debugLog.js';
-import * as util from './util.js';
 import type { LeasedItem } from './types.js';
 
-const ENQUEUE = 'enqueue';
-const DEQUEUE = 'dequeue';
-const LEASE = 'lease';
-const CONFIRM = 'confirm';
-const COUNT = 'count';
-
-interface DBOperation {
-  operation: string;
-  payload?: { payload: unknown };
-  uptoSeq?: number;
-  resolve?: (value: unknown) => void;
-  reject?: (reason?: unknown) => void;
+interface StoredRecord {
+  id?: number;
+  payload: unknown;
 }
 
+const CROSS_CONTEXT_POLL_MS = 300;
+
+function transactionDone (transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+/**
+ * Durable, shared outbox. Records leave only through explicit-id confirm().
+ * The lease cursor is per instance and deliberately ephemeral.
+ */
 export class Queue {
-  private db: IDBDatabase | null;
-  private dbOperationQueue: DBOperation[];
-  private nextDBOperationPromise: ((value: DBOperation) => void) | null;
-  private nextItemPromise: ((value: unknown) => void) | null;
-  // Parked lease consumer (leaseNext() called on an empty/fully-leased queue).
-  // Resolved by a subsequent enqueue (addItemToDB) or by rewind().
-  private nextLeasePromise: ((value: LeasedItem) => void) | null;
-  // Highest seq (id) handed out by leaseNext() this session. LEASE returns the
-  // lowest stored id > leasedThrough; rewind() resets it to resend unconfirmed.
-  private leasedThrough: number;
-  private queueName: string;
-  private dbOperationDispatch: Record<string, (op: DBOperation) => Promise<void>>;
-  nextDBOperation: () => AsyncGenerator<DBOperation>;
+  private readonly ready: Promise<IDBDatabase>;
+  private writes: Promise<void> = Promise.resolve();
+  private leasedThrough = 0;
+  /** Changes whenever rewind/clear invalidates an asynchronous cursor result. */
+  private leaseEpoch = 0;
+  private parkedLease: ((value: LeasedItem | PromiseLike<LeasedItem>) => void) | null = null;
+  private parkedLeaseTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor (queueName: string) {
-    this.db = null;
-    this.dbOperationQueue = [];
-    this.nextDBOperationPromise = null;
-    this.nextItemPromise = null;
-    this.nextLeasePromise = null;
-    this.leasedThrough = 0;
-    this.queueName = queueName;
-
-    this.initialize = this.initialize.bind(this);
-    this.addItemToDB = this.addItemToDB.bind(this);
-    this.nextItemFromDB = this.nextItemFromDB.bind(this);
-    this.leaseFromDB = this.leaseFromDB.bind(this);
-    this.confirmInDB = this.confirmInDB.bind(this);
-    this.countInDB = this.countInDB.bind(this);
-    this.nextDBOperation = util.once(this._nextDBOperation.bind(this));
-    this.startProcessing = this.startProcessing.bind(this);
-    this.addItemToDBOperationQueue = this.addItemToDBOperationQueue.bind(this);
-    this.enqueue = this.enqueue.bind(this);
-    this.dequeue = this.dequeue.bind(this);
-    this.leaseNext = this.leaseNext.bind(this);
-    this.confirm = this.confirm.bind(this);
-    this.rewind = this.rewind.bind(this);
-    this.unconfirmedCount = this.unconfirmedCount.bind(this);
-
-    this.dbOperationDispatch = {
-      [ENQUEUE]: this.addItemToDB,
-      [DEQUEUE]: this.nextItemFromDB,
-      [LEASE]: this.leaseFromDB,
-      [CONFIRM]: this.confirmInDB,
-      [COUNT]: this.countInDB
-    };
-    this.initialize();
-  }
-
-  /**
-   * Determine which environment we are in to set
-   * the appropriate indexeddb information.
-   */
-  async initialize () {
-    let request;
+  constructor (private readonly queueName: string) {
     if (typeof indexedDB === 'undefined') {
-      // Node.js persistent queue is not yet supported.
-      // The sqlite3/indexeddb-js fallback was broken (autoIncrement
-      // unsupported, keys returned out of order) and the imports
-      // break browser bundlers. Use QueueType.IN_MEMORY for now.
-      //
-      // To restore Node support, install sqlite3 and indexeddb-js
-      // and uncomment:
-      //   const sqlite3 = await import('sqlite3');
-      //   const indexeddbjs = await import('indexeddb-js');
-      //   const engine = new sqlite3.default.Database('queue.sqlite');
-      //   const scope = indexeddbjs.makeScope('sqlite3', engine);
-      //   request = scope.indexedDB.open(this.queueName);
-      throw new Error(
-        'IndexedDB is not available in this environment. ' +
-        'Use QueueType.IN_MEMORY for Node.js.'
-      );
-    } else {
-      debug.info('idbQueue: Using browser consoleDB');
-      request = indexedDB.open(this.queueName, 1);
+      throw new Error('IndexedDB is not available. Use QueueType.IN_MEMORY outside a browser.');
     }
-
-    request.onerror = () => {
-      debug.error('QUEUE ERROR: could not open database', request.error);
-    };
-
-    request.onupgradeneeded = async () => {
-      this.db = request.result;
-      const objectStore = this.db.createObjectStore(this.queueName, { keyPath: 'id', autoIncrement: true });
-      objectStore.createIndex('id', 'id');
-    };
-
-    request.onsuccess = () => {
-      this.db = request.result;
-      this.startProcessing();
-    };
+    this.ready = this.open();
   }
 
-  /**
-   * Perform transaction to add item into indexeddb
-   * If we are waiting for an item to available to dequeue,
-   * we resolve the item immediately and don't add it to
-   * the indexeddb.
-   */
-  async addItemToDB (op: DBOperation) {
-    const payload = op.payload!;
-    if (this.nextItemPromise) {
-      this.nextItemPromise(payload.payload);
-      this.nextItemPromise = null;
-      return;
-    }
-    debug.info(`idbQueue: adding item to database, ${payload}`);
-    const transaction = this.db!.transaction([this.queueName], 'readwrite');
-    const objectStore = transaction.objectStore(this.queueName);
-
-    const request = objectStore.add(payload);
-
-    request.onsuccess = () => {
-      // A parked lease consumer (leaseNext on an empty queue) is waiting for
-      // the next item. autoIncrement assigned its id here, so hand it out now
-      // (non-destructively — it stays in the DB until confirm()ed).
-      const newId = request.result as number;
-      if (this.nextLeasePromise && newId > this.leasedThrough) {
-        const resolve = this.nextLeasePromise;
-        this.nextLeasePromise = null;
-        this.leasedThrough = newId;
-        resolve({ seq: newId, item: payload.payload });
-      }
-    };
-
-    request.onerror = () => {
-      if (request.error?.name === 'ConstraintError') {
-        debug.error('IDBQUEUE ERROR: Item already exists', request.error);
-      } else {
-        debug.error('IDBQUEUE ERROR: Error adding item to the queue:', request.error);
-      }
-    };
-  }
-
-  /**
-   * Perform transaction to fetch next item in indexeddb
-   */
-  async nextItemFromDB (op: DBOperation) {
-    const { resolve, reject } = op;
-    debug.info('idbQueue: Fetching next item from database');
-    const transaction = this.db!.transaction([this.queueName], 'readwrite');
-    const objectStore = transaction.objectStore(this.queueName);
-    const request = objectStore.openCursor();
-
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor) {
-        const item = cursor.value;
-        const deleteRequest = objectStore.delete(cursor.key);
-
-        deleteRequest.onsuccess = () => {
-          resolve!(item.payload);
-        };
-
-        deleteRequest.onerror = () => {
-          debug.error('IDBQUEUE ERROR: Error removing item from the queue:', deleteRequest.error);
-          reject!(deleteRequest.error);
-        };
-      } else {
-        // No more items in the IndexedDB.
-        resolve!(new Promise((resolve) => {
-          this.nextItemPromise = resolve;
-        }));
-      }
-    };
-
-    request.onerror = () => {
-      debug.error('IDBQUEUE ERROR: Error reading queue cursor:', request.error);
-      reject!(request.error);
-    };
-  }
-
-  /**
-   * Lease the next item WITHOUT deleting it: the lowest-id record with
-   * id > leasedThrough. Advances leasedThrough so the next lease moves
-   * forward. If none is available, park until a matching enqueue (or a
-   * rewind) hands one over. The item stays in the DB until confirm().
-   */
-  async leaseFromDB (op: DBOperation) {
-    const { resolve, reject } = op;
-    const transaction = this.db!.transaction([this.queueName], 'readonly');
-    const objectStore = transaction.objectStore(this.queueName);
-    const request = objectStore.openCursor(IDBKeyRange.lowerBound(this.leasedThrough, true));
-
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor) {
-        const id = cursor.key as number;
-        this.leasedThrough = id;
-        resolve!({ seq: id, item: cursor.value.payload } as LeasedItem);
-      } else {
-        // Nothing new to lease — park; addItemToDB (or rewind) resolves it.
-        this.nextLeasePromise = resolve as (value: LeasedItem) => void;
-      }
-    };
-
-    request.onerror = () => {
-      debug.error('IDBQUEUE ERROR: Error leasing queue cursor:', request.error);
-      reject!(request.error);
-    };
-  }
-
-  /**
-   * Cumulative ack: delete every stored record with id <= uptoSeq. A single
-   * ranged delete covers the whole confirmed prefix in one transaction.
-   */
-  async confirmInDB (op: DBOperation) {
-    const transaction = this.db!.transaction([this.queueName], 'readwrite');
-    const objectStore = transaction.objectStore(this.queueName);
-    const request = objectStore.delete(IDBKeyRange.upperBound(op.uptoSeq!));
-
-    request.onsuccess = () => { op.resolve?.(undefined); };
-    request.onerror = () => {
-      debug.error('IDBQUEUE ERROR: Error confirming (deleting) items:', request.error);
-      op.reject?.(request.error);
-    };
-  }
-
-  /** Count stored (unconfirmed) records. */
-  async countInDB (op: DBOperation) {
-    const transaction = this.db!.transaction([this.queueName], 'readonly');
-    const objectStore = transaction.objectStore(this.queueName);
-    const request = objectStore.count();
-
-    request.onsuccess = () => { op.resolve!(request.result); };
-    request.onerror = () => {
-      debug.error('IDBQUEUE ERROR: Error counting items:', request.error);
-      op.reject!(request.error);
-    };
-  }
-
-  /**
-   * The processing loop continually waits for the next
-   * dbOperation to come using the following generator.
-   */
-  private async * _nextDBOperation (): AsyncGenerator<DBOperation> {
-    while (true) {
-      let operation: DBOperation;
-      if (this.dbOperationQueue.length > 0) {
-        operation = this.dbOperationQueue.shift()!;
-      } else {
-        operation = await new Promise<DBOperation>(resolve => {
-          this.nextDBOperationPromise = resolve;
-        });
-      }
-      debug.info(`idbQueue: Yielding next operation, ${operation}`);
-      yield operation;
-    }
-  }
-
-  /**
-   * This method processes incoming dbOperations
-   */
-  async startProcessing () {
-    const dbOperationStream = this.nextDBOperation();
-
-    for await (const operation of dbOperationStream) {
-      debug.info(`idbQueue: processing operation ${operation}`);
-      try {
-        await this.dbOperationDispatch[operation.operation](operation);
-      } catch (error) {
-        debug.error('Unable to perform operation on DB', error);
-      }
-    }
-  }
-
-  // helper function for enqueue/dequeue
-  addItemToDBOperationQueue (payload: DBOperation) {
-    if (this.nextDBOperationPromise) {
-      this.nextDBOperationPromise(payload);
-      this.nextDBOperationPromise = null;
-    } else {
-      this.dbOperationQueue.push(payload);
-    }
-  }
-
-  /**
-   * This functions will append an enqueue message to the
-   * current operation stream.
-   */
-  enqueue (item: unknown) {
-    debug.info(`idbQueue: Enqueuing item ${item}`);
-    const payload = {
-      operation: ENQUEUE,
-      payload: { payload: item }
-    };
-    this.addItemToDBOperationQueue(payload);
-  }
-
-  /**
-   * This function appends a dequeue message to the operation
-   * stream and returns the result.
-   */
-  dequeue () {
-    debug.info('idbQueue: dequeueing item');
+  private open (): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {
-      const payload = { operation: DEQUEUE, resolve, reject };
-      this.addItemToDBOperationQueue(payload);
+      const request = indexedDB.open(this.queueName, 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore(this.queueName, { keyPath: 'id', autoIncrement: true });
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error(`IndexedDB queue ${this.queueName} is blocked`));
     });
   }
 
-  /** Lease the next unconfirmed item (non-destructive). See leaseFromDB. */
-  leaseNext (): Promise<LeasedItem> {
-    return new Promise<LeasedItem>((resolve, reject) => {
-      this.addItemToDBOperationQueue({
-        operation: LEASE,
-        resolve: resolve as (value: unknown) => void,
-        reject
-      });
+  /** Serialize local writes so a following local read observes them. A failed
+   * write is loud and does not poison later operations. The public logger API
+   * remains non-awaitable; surfacing admission failure is tracked in spec §11. */
+  private scheduleWrite (write: () => Promise<void>): void {
+    const operation = this.writes.then(write);
+    this.writes = operation.catch(error => {
+      debug.error(`IndexedDB queue ${this.queueName} write failed`, error);
     });
   }
 
-  /** Cumulative ack — delete everything with seq <= uptoSeq. Fire-and-forget. */
-  confirm (uptoSeq: number) {
-    this.addItemToDBOperationQueue({ operation: CONFIRM, uptoSeq });
+  enqueue (item: unknown): void {
+    this.scheduleWrite(async () => {
+      const db = await this.ready;
+      const transaction = db.transaction(this.queueName, 'readwrite');
+      transaction.objectStore(this.queueName).add({ payload: item } satisfies StoredRecord);
+      await transactionDone(transaction);
+      this.wakeParkedLease();
+    });
   }
 
-  /**
-   * Reset the lease cursor so the next lease re-hands unconfirmed items from
-   * the lowest stored id (resend on reconnect). If a lease consumer is parked
-   * (nothing was left to lease), re-issue a LEASE so it re-hands the earliest
-   * still-stored item instead of waiting for a fresh enqueue.
-   */
-  rewind () {
-    this.leasedThrough = 0;
-    if (this.nextLeasePromise) {
-      const resolve = this.nextLeasePromise;
-      this.nextLeasePromise = null;
-      this.addItemToDBOperationQueue({
-        operation: LEASE,
-        resolve: resolve as (value: unknown) => void,
-        reject: () => {}
+  /** Scan using a captured cursor. The caller checks leaseEpoch before applying
+   * the result, so a rewind during this transaction cannot be overwritten. */
+  private async scan (after: number): Promise<LeasedItem | null> {
+    await this.writes;
+    const db = await this.ready;
+    const transaction = db.transaction(this.queueName, 'readonly');
+    const request = transaction.objectStore(this.queueName)
+      .openCursor(IDBKeyRange.lowerBound(after, true));
+    const leased = await new Promise<LeasedItem | null>((resolve, reject) => {
+      request.onsuccess = () => {
+        const cursor = request.result;
+        resolve(cursor
+          ? { seq: cursor.key as number, item: (cursor.value as StoredRecord).payload }
+          : null);
+      };
+      request.onerror = () => reject(request.error);
+    });
+    await transactionDone(transaction);
+    return leased;
+  }
+
+  async leaseNext (): Promise<LeasedItem> {
+    while (true) {
+      const epoch = this.leaseEpoch;
+      const leased = await this.scan(this.leasedThrough);
+      if (epoch !== this.leaseEpoch) continue;
+      if (leased) {
+        this.leasedThrough = leased.seq;
+        return leased;
+      }
+
+      return await new Promise(resolve => {
+        this.parkedLease = resolve;
+        this.scheduleParkedPoll();
       });
     }
   }
 
-  /** Count of stored (unconfirmed) items. */
-  unconfirmedCount (): Promise<number> {
-    return new Promise<number>((resolve, reject) => {
-      this.addItemToDBOperationQueue({
-        operation: COUNT,
-        resolve: resolve as (value: unknown) => void,
-        reject
-      });
+  confirm (seqs: number[]): void {
+    if (!seqs.length) return;
+    this.scheduleWrite(async () => {
+      const db = await this.ready;
+      const transaction = db.transaction(this.queueName, 'readwrite');
+      const store = transaction.objectStore(this.queueName);
+      for (const seq of new Set(seqs)) {
+        const request = store.delete(seq);
+        request.onerror = event => {
+          // Prevent one request error from aborting and rolling back its sibling
+          // deletes. Promise settlement belongs to the transaction (L15).
+          event.preventDefault();
+          debug.error(`Unable to confirm IndexedDB record ${seq}`, request.error);
+        };
+      }
+      await transactionDone(transaction);
     });
+  }
+
+  rewind (): void {
+    this.leaseEpoch++;
+    this.leasedThrough = 0;
+    this.wakeParkedLease();
+  }
+
+  async unconfirmedCount (): Promise<number> {
+    await this.writes;
+    const db = await this.ready;
+    const transaction = db.transaction(this.queueName, 'readonly');
+    const request = transaction.objectStore(this.queueName).count();
+    return await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async maxSeq (): Promise<number | null> {
+    await this.writes;
+    const db = await this.ready;
+    const transaction = db.transaction(this.queueName, 'readonly');
+    const request = transaction.objectStore(this.queueName).openCursor(null, 'prev');
+    return await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result ? request.result.key as number : null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async unleasedAtOrBelow (seq: number): Promise<number> {
+    // A failed send can rewind while this asynchronous count is in flight.
+    // Re-run against the new cursor rather than letting a pre-rewind zero clear
+    // the snapshot barrier with unsent backlog still present.
+    while (true) {
+      const epoch = this.leaseEpoch;
+      const leasedThrough = this.leasedThrough;
+      await this.writes;
+      if (epoch !== this.leaseEpoch) continue;
+      if (leasedThrough >= seq) return 0;
+
+      const db = await this.ready;
+      const transaction = db.transaction(this.queueName, 'readonly');
+      const range = IDBKeyRange.bound(leasedThrough, seq, true, false);
+      const request = transaction.objectStore(this.queueName).count(range);
+      const count = await new Promise<number>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      await transactionDone(transaction);
+      if (epoch === this.leaseEpoch) return count;
+    }
+  }
+
+  async inspect (limit = 20): Promise<unknown[]> {
+    await this.writes;
+    const db = await this.ready;
+    const transaction = db.transaction(this.queueName, 'readonly');
+    const request = transaction.objectStore(this.queueName).getAll(undefined, limit);
+    return await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  clear (): void {
+    this.scheduleWrite(async () => {
+      const db = await this.ready;
+      const transaction = db.transaction(this.queueName, 'readwrite');
+      transaction.objectStore(this.queueName).clear();
+      await transactionDone(transaction);
+      this.leaseEpoch++;
+      this.leasedThrough = 0;
+    });
+  }
+
+  /** IndexedDB has no portable cross-context change event. Every wake re-runs
+   * the normal scan, and a slow poll discovers records committed by other tabs.
+   * BroadcastChannel would only be an optimization; correctness stays here. */
+  private scheduleParkedPoll (): void {
+    if (!this.parkedLease || this.parkedLeaseTimer !== null) return;
+    this.parkedLeaseTimer = setTimeout(() => this.wakeParkedLease(), CROSS_CONTEXT_POLL_MS);
+    (this.parkedLeaseTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private wakeParkedLease (): void {
+    if (!this.parkedLease) return;
+    if (this.parkedLeaseTimer !== null) clearTimeout(this.parkedLeaseTimer);
+    this.parkedLeaseTimer = null;
+    const resolve = this.parkedLease;
+    this.parkedLease = null;
+    resolve(this.leaseNext());
   }
 }

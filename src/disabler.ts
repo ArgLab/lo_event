@@ -100,6 +100,17 @@ export function streamEvents () {
   return action === EVENT_ACTION.TRANSMIT;
 }
 
+/** Explicit predicates for the two permanent cases. Callers must never infer a
+ * privacy deletion from retry()'s boolean: permanent MAINTAIN means retain the
+ * outbox forever, while permanent DROP is the one sanctioned destructive case. */
+export function isPermanent (): boolean {
+  return expiration === TIME_LIMIT.PERMANENT;
+}
+
+export function isPermanentOptOut (): boolean {
+  return isPermanent() && action === EVENT_ACTION.DROP;
+}
+
 /**
  * Determines if a client should retry based on the `expiration` status.
  * This function:
@@ -108,14 +119,15 @@ export function streamEvents () {
  *    initializations), and then returns `true` to allow a retry.
  */
 export async function retry () {
-  if (expiration === TIME_LIMIT.PERMANENT) {
-    return false;
-  }
-  const now = Date.now();
-  if (now < expiration!) {
-    debug.info(`waiting for expiration to happen ${new Date(expiration!).toString()}`);
-    await util.delay(expiration! - now);
-    debug.info('we are done waiting');
+  while (true) {
+    if (expiration === TIME_LIMIT.PERMANENT) return false;
+    const deadline = expiration;
+    const now = Date.now();
+    if (deadline === null || now >= deadline) break;
+    debug.info(`waiting for expiration to happen ${new Date(deadline).toString()}`);
+    await util.delay(deadline - now);
+    // A later block frame may have extended or made the block permanent while
+    // we slept. Re-read state instead of clearing that newer instruction.
   }
   action = DEFAULTS.action;
   expiration = DEFAULTS.expiration;
