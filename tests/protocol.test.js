@@ -189,29 +189,47 @@ describe('state snapshot', () => {
 describe('annotated wire trace', () => {
   it('sends the crash backlog before the snapshot and resends unacked work', () => {
     const engine = new DeliveryEngine();
-    engine.requestState(FETCH);
-    engine.connected();
+    const sent = [];
+    const confirmed = [];
+    const track = decisions => {
+      sent.push(...pick(decisions, 'sendFrame').map(decision => decision.seq));
+      sent.push(...pick(decisions, 'askForState').map(() => 'fetch_blob'));
+      confirmed.push(...pick(decisions, 'confirmIds').flatMap(decision => decision.ids));
+      return decisions;
+    };
+
+    track(engine.connected());
+    track(engine.requestState(FETCH));
     const first = engine.generation();
-    engine.watermarkResult(first, 2);
+    track(engine.watermarkResult(first, 42));
 
-    engine.recordLeased(1, 'B.S1.1', '{}');
-    engine.sendCompleted(first);
-    engine.probeResult(first, 1);
-    engine.recordLeased(2, 'B.S1.2', '{}');
-    engine.sendCompleted(first);
-    expect(engine.probeResult(first, 0))
-      .toEqual([{ do: 'askForState', frame: FETCH }]);
+    track(engine.recordLeased(41, 'B.S1.38', '{"event":"save_blob"}'));
+    track(engine.sendCompleted(first));
+    track(engine.probeResult(first, 1));
+    track(engine.recordLeased(42, 'B.S1.39', '{"event":"answer"}'));
+    track(engine.sendCompleted(first));
+    track(engine.probeResult(first, 0));
+    track(engine.stateSendCompleted(first));
 
-    engine.stateSendCompleted(first);
-    engine.recordLeased(3, 'B.S1.3', '{}');
-    engine.sendCompleted(first);
-    engine.disconnected();
-    engine.connected();
+    track(engine.recordLeased(43, 'B.S2.1', '{"event":"keystroke"}'));
+    track(engine.sendCompleted(first));
+    track(engine.ackReceived('B.S1.38'));
+    track(engine.ackReceived('B.S1.39'));
+    track(engine.stateReceived());
+
+    expect(sent).toEqual([41, 42, 'fetch_blob', 43]);
+    expect(confirmed).toEqual([41, 42]);
+
+    track(engine.disconnected());
+    track(engine.connected());
     const second = engine.generation();
-    engine.watermarkResult(second, 3);
-    engine.recordLeased(3, 'B.S1.3', '{}');
-    engine.sendCompleted(second);
-    expect(engine.ackReceived('B.S1.3'))
-      .toEqual([{ do: 'confirmIds', ids: [3] }, { do: 'probeQueue', watermark: 3 }]);
+    track(engine.watermarkResult(second, 43));
+    track(engine.recordLeased(43, 'B.S2.1', '{"event":"keystroke"}'));
+    track(engine.sendCompleted(second));
+    track(engine.probeResult(second, 0));
+    track(engine.ackReceived('B.S2.1'));
+
+    expect(sent).toEqual([41, 42, 'fetch_blob', 43, 43]);
+    expect(confirmed).toEqual([41, 42, 43]);
   });
 });

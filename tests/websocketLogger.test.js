@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { websocketLogger } from '../src/websocketLogger.js';
 import { QueueType } from '../src/queue.js';
+import { Queue as IndexedDBQueue } from '../src/indexeddbQueue.js';
 import { storage } from '../src/browserStorage.js';
 import 'fake-indexeddb/auto';
 
@@ -18,6 +19,7 @@ class FakeWebSocket {
   onerror = null;
   onmessage = null;
   sent = [];
+  sentRaw = [];
   failSends = false;
 
   constructor () {
@@ -33,8 +35,15 @@ class FakeWebSocket {
   send (data) {
     if (this.readyState !== 1) throw new Error('socket is not open');
     if (this.failSends) throw new Error('simulated send failure');
-    const frame = JSON.parse(String(data));
-    this.sent.push(frame);
+    const raw = String(data);
+    this.sentRaw.push(raw);
+    let frame;
+    try {
+      frame = JSON.parse(raw);
+      this.sent.push(frame);
+    } catch {
+      return;
+    }
     if (frame.event === 'fetch_blob' && FakeWebSocket.answerSnapshots) {
       queueMicrotask(() => this.onmessage?.({
         data: JSON.stringify({ status: 'fetch_blob', data: {} })
@@ -107,6 +116,71 @@ describe('WebSocket adapter', () => {
     await vi.waitFor(() => expect(socket.sent.filter(frame => frame.event === 'fetch_blob')).toHaveLength(2));
   });
 
+  it('drains a legacy stored record that cannot be named', async () => {
+    const namespace = crypto.randomUUID();
+    const queue = new IndexedDBQueue(`lo-event:${encodeURIComponent(namespace)}:durable`);
+    queue.enqueue('{ legacy invalid json');
+    await queue.unconfirmedCount();
+
+    const { logger, socket } = await connectedLogger({
+      namespace,
+      queueType: QueueType.PERSISTENT,
+      fetchState: false
+    });
+    await vi.waitFor(() => expect(socket.sentRaw).toContain('{ legacy invalid json'));
+    await vi.waitFor(async () => expect(await logger.unackedCount()).toBe(0));
+  });
+
+  it('dispatches server side-channel frames', async () => {
+    const previousWindow = globalThis.window;
+    const eventTarget = new EventTarget();
+    globalThis.window = eventTarget;
+    const received = {};
+    for (const eventName of ['auth', 'save_blob_ack', 'save_blob_nack', 'server-event']) {
+      eventTarget.addEventListener(eventName, event => { received[eventName] = event.detail; });
+    }
+
+    try {
+      const { socket } = await connectedLogger({ fetchState: false });
+      socket.receive({ status: 'auth', user_id: 'u-1', display_name: 'Ada' });
+      socket.receive({ status: 'local_storage', key: 'server-key', value: 42 });
+      socket.receive({ status: 'browser_event', event_type: 'server-event', detail: { ok: true } });
+      socket.receive({ status: 'save_blob_ack', token: 7 });
+      socket.receive({ status: 'save_blob_nack', token: 8 });
+
+      expect(received).toEqual({
+        auth: { user_id: 'u-1', display_name: 'Ada' },
+        'server-event': { ok: true },
+        save_blob_ack: { token: 7 },
+        save_blob_nack: { token: 8 }
+      });
+      const stored = await new Promise(resolve => {
+        storage.get(['user_id', 'display_name', 'server-key'], resolve);
+      });
+      expect(stored).toEqual({ user_id: 'u-1', display_name: 'Ada', 'server-key': 42 });
+    } finally {
+      if (previousWindow === undefined) delete globalThis.window;
+      else globalThis.window = previousWindow;
+    }
+  });
+
+  it('rejects application protocol frames at admission', async () => {
+    const { logger } = await connectedLogger({ fetchState: false });
+    for (const event of ['fetch_blob', 'save_blob', 'lock_fields']) {
+      expect(() => logger(JSON.stringify({ event }))).toThrow(/reserved/);
+    }
+  });
+
+  it('ignores malformed server frames without stopping delivery', async () => {
+    const { logger, socket } = await connectedLogger({ fetchState: false });
+    socket.onmessage({ data: 'not json' });
+    logger(JSON.stringify({ event: 'after-malformed-frame' }));
+
+    await vi.waitFor(() => {
+      expect(socket.sent.some(frame => frame.event === 'after-malformed-frame')).toBe(true);
+    });
+  });
+
   it('initializes only once when init is called repeatedly', async () => {
     const before = FakeWebSocket.instances.length;
     const logger = websocketLogger('ws://test.invalid', {
@@ -176,6 +250,11 @@ describe('WebSocket adapter', () => {
       'answer',
       'lock_fields'
     ]);
+    const lockIds = second.sent
+      .filter(frame => frame.event === 'lock_fields')
+      .map(frame => frame.metadata.eventId);
+    expect(lockIds[0]).toBe('initial-lock');
+    expect(lockIds[1]).not.toBe('initial-lock');
   });
 
   it('retires an OPEN socket whose send throws, then retries on a new connection', async () => {
@@ -196,7 +275,7 @@ describe('WebSocket adapter', () => {
   });
 
   // This mutates module-global disabler state permanently, so it stays last.
-  it('a block arriving while leaseNext is parked prevents the next record from sending', async () => {
+  it('a permanent hold retains a parked record and a privacy opt-out clears it', async () => {
     const { logger, socket } = await connectedLogger({ fetchState: false });
     // The drain loop is parked on an empty queue at this point.
     socket.receive({
@@ -211,5 +290,13 @@ describe('WebSocket adapter', () => {
     await vi.waitFor(async () => expect(await logger.unackedCount()).toBe(1));
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(socket.sent.some(frame => frame.event === 'must-stay-local')).toBe(false);
+
+    socket.receive({
+      status: 'blocklist',
+      message: 'privacy opt-out',
+      time_limit: 'PERMANENT',
+      action: 'DROP'
+    });
+    await vi.waitFor(async () => expect(await logger.unackedCount()).toBe(0));
   });
 });

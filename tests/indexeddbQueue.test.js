@@ -43,6 +43,22 @@ describe('IndexedDB outbox contract', () => {
     expect(await waiting).toEqual({ seq: 1, item: 'other-tab' });
   });
 
+  it('a parked lease wakes with the lowest stored record, not the local waker', async () => {
+    const database = name('lowest-on-wake');
+    const firstTab = new Queue(database);
+    const secondTab = new Queue(database);
+    firstTab.enqueue('first');
+    await firstTab.unconfirmedCount();
+    await firstTab.leaseNext();
+
+    const waiting = firstTab.leaseNext();
+    secondTab.enqueue('lower-cross-tab-record');
+    await secondTab.unconfirmedCount();
+    firstTab.enqueue('local-waker');
+
+    expect(await waiting).toEqual({ seq: 2, item: 'lower-cross-tab-record' });
+  });
+
   it('a rewind racing an in-progress scan cannot be overwritten', async () => {
     const queue = new Queue(name('rewind-race'));
     queue.enqueue('first');
