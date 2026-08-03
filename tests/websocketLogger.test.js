@@ -187,6 +187,27 @@ describe('durable delivery', () => {
   });
 });
 
+describe('starting up', () => {
+  it('init() is idempotent — a second call does not raise a second sender', async () => {
+    // Two connection loops and two lease loops over one outbox means two
+    // sockets from one context, both draining the same store. Nothing would
+    // look broken — the store is *designed* to tolerate several senders across
+    // tabs (§2) — it would just deliver everything twice from a context that
+    // meant to deliver it once.
+    const { websocketLogger } = await freshModules();
+    const url = `ws://test-${++urlCounter}.invalid`;
+    const logger = websocketLogger(url, OPTIONS);
+
+    await Promise.all([logger.init(), logger.init()]);
+    await logger.init();
+
+    const sockets = () => FakeSocket.instances.filter(socket => socket.url === url);
+    await vi.waitFor(() => expect(sockets().length).toBeGreaterThan(0));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(sockets()).toHaveLength(1);
+  });
+});
+
 describe('send-and-forget delivery', () => {
   it('confirms on an OPEN-socket send and ignores server acks', async () => {
     const { websocketLogger } = await freshModules();

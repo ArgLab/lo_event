@@ -153,8 +153,9 @@ places where one of them was better, adopted here with a test each:
   race a round-1 build lost), and loEvent's fan-out contract, covering
   `configure()` and sibling isolation when a logger throws (sol).
 
-Two further defects sol found by reviewing this build, both real and both
-fixed here:
+Four further defects the sibling builds' reviews found in this one, all real
+and all fixed here. Two reviewers independently reported the first, which is
+the strongest evidence any finding in this exercise has had:
 
 - **`retry()` could clear a block that was extended while it slept.** It read
   `expiration` once on entry and cleared the state unconditionally afterwards,
@@ -176,6 +177,16 @@ fixed here:
   lease that surfaces while a blocklist has sending paused. Narrow enough that
   a timing test would pass with or without the guard, so it is covered by
   reasoning rather than by a test that would prove nothing.
+- **`init()` was not idempotent** (fable). A second call raised a second
+  connection loop and a second lease loop over one outbox: two sockets from one
+  context, both draining the same store. Nothing would look broken — the store
+  is *designed* to tolerate several senders across tabs (§2) — it would just
+  deliver everything twice from a context that meant to deliver it once.
+  `init()` now returns the first call's promise. *(websocketLogger.test.js:
+  "init() is idempotent — a second call does not raise a second sender",
+  verified to fail without the guard.)*
+- **The tick reported a fictional interval** (fable, and sol reached the same
+  place from the throttling side). Fixed above, under the adopted ideas.
 
 Not adopted, deliberately:
 

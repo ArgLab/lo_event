@@ -152,6 +152,8 @@ export function websocketLogger (
   /** Bumped by every rewind. A barrier probe issued before one has been
    *  answered about a cursor that has since moved, so its answer is dropped. */
   let probeEpoch = 0;
+  /** The one in-flight start, so init() is idempotent (see below). */
+  let started: Promise<void> | null = null;
   /** The session's locked context fields, replayed as a freshly stamped frame
    *  on every connection (§5 step 2). We keep the *fields*, never a stamped
    *  frame: an object that has ever carried an eventId is never enqueued again
@@ -549,7 +551,23 @@ export function websocketLogger (
     storeNamespace = source;
   };
 
-  wsLogData.init = async function () {
+  /**
+   * Idempotent by construction: a second init() returns the first one's
+   * promise rather than starting over.
+   *
+   * Starting twice would raise a second connection loop and a second lease
+   * loop over one outbox — two sockets from one context, and two senders
+   * racing the same lease cursor. The store tolerates several senders *across
+   * tabs* by design (§2), which is exactly why this is easy to miss: nothing
+   * would look broken, it would just deliver everything twice from a context
+   * that only meant to deliver it once.
+   */
+  wsLogData.init = function () {
+    started ??= start();
+    return started;
+  };
+
+  async function start () {
     try {
       const stored = await new Promise<Record<string, unknown>>(resolve => storage.get('lo_server', resolve as never));
       if (stored?.lo_server) {
@@ -570,7 +588,7 @@ export function websocketLogger (
     connectionLoop();
     leaseLoop();
     if (fetchState) wsLogData.requestState!();
-  };
+  }
 
   /** Context fields locked for the session. The frame loEvent stamped is
    *  enqueued as-is; the *fields* are kept for the per-connection replay. */
