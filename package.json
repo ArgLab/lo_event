@@ -1,6 +1,6 @@
 {
   "name": "lo_event",
-  "version": "0.0.5",
+  "version": "0.0.9-ack.0",
   "description": "Event logging library for the Learning Observer",
   "main": "dist/loEvent.js",
   "types": "dist/loEvent.d.ts",
@@ -61,10 +61,23 @@
     "./types": {
       "types": "./dist/types.d.ts",
       "import": "./dist/types.js"
+    },
+    "./hooks": {
+      "types": "./dist/hooks.d.ts",
+      "import": "./dist/hooks.js"
+    }
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
     }
   },
   "scripts": {
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
     "test:watch": "vitest",
     "build": "tsup",
     "prepublishOnly": "npm run build",
@@ -100,6 +113,7 @@
     "@types/ws": "^8.18.1",
     "@typescript-eslint/parser": "^8.55.0",
     "eslint": "^9.39.2",
+    "fake-indexeddb": "^6.2.5",
     "globals": "^17.3.0",
     "parcel": "^2.12.0",
     "react": "^19.2.4",

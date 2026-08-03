@@ -3,6 +3,7 @@
 */
 
 import { timestampEvent, mergeMetadata } from './util.js';
+import type { QueueDebug } from './types.js';
 import { getBrowserInfo } from './metadata/browserinfo.js';
 import * as Queue from './queue.js';
 import * as disabler from './disabler.js';
@@ -114,6 +115,97 @@ async function lockFieldsAsync (data: Record<string, unknown>[]) {
   await Promise.all(authpromises);
 }
 
+/**
+ * Total enqueued-but-unacked events across all ack-aware loggers (currently
+ * websocketLogger). Zero means every event has been durably acknowledged by
+ * the server — the precise "is anything unsaved?" signal for a beforeunload
+ * warning, replacing the blob-based heuristic. Loggers without ack support
+ * (which confirm on send) contribute zero.
+ */
+export async function unackedCount (): Promise<number> {
+  const counts = await Promise.all(
+    loggersEnabled
+      .filter(logger => typeof logger.unackedCount === 'function')
+      .map(logger => Promise.resolve(logger.unackedCount!()))
+  );
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * Console debugging for the durable queue.
+ *
+ * Attached to `globalThis.loDebug` in browsers, because the useful moment for
+ * this is a console prompt in a stuck tab, where there is no module to import:
+ *
+ *   loDebug.queue()        what is waiting, and WHY it is waiting
+ *   loDebug.clearQueue()   drop everything, unsent included
+ *
+ * `queue()` summarizes rather than dumping records. A queue that only grows
+ * looks identical whether the client is offline, the server is not acking, or
+ * a frame was enqueued that can never BE acked — and the last one is invisible
+ * in a raw dump unless you happen to notice a missing field. So it counts the
+ * unnamed records explicitly and breaks the rest down by event type, which is
+ * what turns "there are a ton of save_blobs" into a diagnosis.
+ */
+async function queueReport (limit = 50): Promise<Record<string, unknown>[]> {
+  const handles = loggersEnabled.filter(l => l.queueDebug).map(l => l.queueDebug!);
+  if (!handles.length) {
+    console.log('loDebug: no ack-aware logger with a durable queue.');
+    return [];
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  let total = 0;
+  let unnamed = 0;
+  const byType: Record<string, number> = {};
+
+  for (const h of handles) {
+    total += await h.count();
+    for (const rec of await h.inspect(limit)) {
+      // Records are stored as { seq, payload } (memory) or the raw stored
+      // object (IDB); the payload is the serialized frame either way.
+      const r = rec as Record<string, unknown>;
+      const raw = (r.payload ?? r) as unknown;
+      let frame: Record<string, any> = {};
+      try { frame = typeof raw === 'string' ? JSON.parse(raw) : (raw as any) ?? {}; }
+      catch { /* unparseable — reported as unknown below */ }
+
+      const type = frame.event ?? frame.type ?? '(unknown)';
+      const id = frame?.metadata?.eventId;
+      byType[type] = (byType[type] ?? 0) + 1;
+      if (!id) unnamed++;
+      rows.push({ seq: r.seq, event: type, eventId: id ?? '— UNNAMED —', bytes: JSON.stringify(frame).length });
+    }
+  }
+
+  console.log(`loDebug: ${total} record(s) waiting; showing up to ${limit}.`);
+  console.table(byType);
+  if (unnamed) {
+    console.warn(
+      `loDebug: ${unnamed} of the first ${limit} record(s) inspected have no ` +
+      'metadata.eventId (the total above may hold more). The server acks ' +
+      'by name, so these can never be acked — they are sent best-effort and ' +
+      'dropped. If they keep appearing, an enqueue path is not stamping.'
+    );
+  }
+  console.table(rows);
+  return rows;
+}
+
+function clearQueues (): void {
+  const handles = loggersEnabled.filter(l => l.queueDebug).map(l => l.queueDebug!);
+  handles.forEach(h => h.clear());
+  console.warn(`loDebug: cleared ${handles.length} queue(s) — unsent events discarded.`);
+}
+
+export const loDebug = { queue: queueReport, clearQueue: clearQueues };
+
+// Attach for console use. Debug-only affordance, browser-only, and it never
+// overwrites something already there.
+if (typeof globalThis !== 'undefined' && !(globalThis as any).loDebug) {
+  (globalThis as any).loDebug = loDebug;
+}
+
 // TODO: We should consider specifying a set of verbs, nouns, etc. we
 // might use, and outlining what can be expected in the protocol
 // TODO: We should consider structing / destructing here
@@ -125,7 +217,6 @@ export function init (
     debugLevel = debug.LEVEL.NONE as string,
     debugDest = [debug.LOG_OUTPUT.CONSOLE] as LogDestination[],
     useDisabler = true,
-    queueType = Queue.QueueType.AUTODETECT as string,
     sendBrowserInfo = false,
     verboseEvents = false,
     metadata = [] as MetadataTask[],
@@ -135,7 +226,9 @@ export function init (
   if (!version || typeof version !== 'string') throw new Error('version must be a non-null string');
 
   util.setVerboseEvents(verboseEvents);
-  queue = new Queue.Queue('LOEvent', { queueType });
+  // The front desk only preserves pre-go ordering. Durability belongs to each
+  // logger's outbox, so a second disk queue here would add a destructive hop.
+  queue = new Queue.Queue('LOEvent', { queueType: Queue.QueueType.IN_MEMORY });
 
   debug.setLevel(debugLevel);
   debug.setLogOutputs(debugDest);
@@ -144,6 +237,7 @@ export function init (
   }
 
   loggersEnabled = loggers;
+  loggersEnabled.forEach(logger => logger.configure?.({ source }));
   initialized = INIT_STATES.IN_PROGRESS;
   pendingSource = source;
   pendingVersion = version;
@@ -183,7 +277,6 @@ export function go () {
     initialized = INIT_STATES.READY;
     queue.startDequeueLoop({
       initialize: isInitialized,
-      shouldDequeue: disabler.retry,
       onDequeue: sendEvent
     });
   });
@@ -196,17 +289,19 @@ function sendEvent (event: unknown) {
       logger(jsonEncodedEvent);
     } catch (error) {
       if (error instanceof disabler.BlockError) {
-        // Handle BlockError exception here
         disabler.handleBlockError(error);
       } else {
-        // Other types of exceptions will propagate up
-        throw error;
+        // One logger must never cost its siblings their copy of an event.
+        debug.error(`Logger ${logger.lo_id ?? logger.lo_name ?? 'unnamed'} threw on an event`, error);
       }
     }
   }
 }
 
 export function logEvent (eventType: string, event: Record<string, unknown>) {
+  if (util.isProtocolEventName(eventType)) {
+    throw new Error(`logEvent: '${eventType}' is a reserved protocol frame name`);
+  }
   // opt out / dead
   if (!disabler.storeEvents()) {
     return;

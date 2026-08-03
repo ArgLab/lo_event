@@ -3,6 +3,13 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { storage } from './browserStorage.js';
 
+/** Application events share their `event` field with protocol frames. */
+const RESERVED_EVENT_NAMES = new Set(['fetch_blob', 'save_blob', 'lock_fields']);
+
+export function isProtocolEventName (eventName: string): boolean {
+  return RESERVED_EVENT_NAMES.has(eventName);
+}
+
 /**
  * Helper function for copying specific field values
  * from a given source. This is called to collect browser
@@ -116,7 +123,8 @@ export function setVerboseEvents(value: boolean): void {
  *  event = { event: 'ADD', data: 'stuff' }
  *  timestampEvent(event)
  *  event
- *  // { event: 'ADD', data: 'stuff', metadata: { ts, human_ts, iso_ts, sessionIndex, sessionTag } }
+ *  // { event: 'ADD', data: 'stuff', metadata: { ts, human_ts, iso_ts, eventId,
+ *  //                                              browserTag, sessionTag, sessionSeq } }
  */
 export function timestampEvent (event: Record<string, unknown>): void {
   if (!event.metadata) {
@@ -125,12 +133,37 @@ export function timestampEvent (event: Record<string, unknown>): void {
 
   const metadata = event.metadata as Record<string, unknown>;
   metadata.iso_ts = new Date().toISOString();
+
+  // IDENTITY — always stamped, never gated on verboseEvents.
+  //
+  // `eventId` is `<browser>.<session>.<seq>`, and it is the name the ack
+  // protocol references, so it is load-bearing rather than a debugging
+  // nicety. Three properties earn it that job:
+  //   - it means the same thing to everyone, forever (unlike a per-connection
+  //     counter, which is meaningful only to the socket that issued it), so an
+  //     ack is a fact about the world: "the server durably has this event";
+  //   - any tab can therefore act on an ack for a record it did not send —
+  //     which is what lets one tab drain another's leftovers safely;
+  //   - it survives reconnects, so a server can eventually say "I already have
+  //     <session> through <seq>" and skip a resend.
+  //
+  // `session` is one JS CONTEXT's lifetime — a page load, an extension
+  // background page, a worker, a node process. Deliberately not "tab": lo_event
+  // runs where there is no tab, and a name that is false in a real deployment
+  // is worse than a slightly abstract one.
+  const seq = eventIndex++;
+  metadata.browserTag = browserStamp();
+  metadata.sessionTag = sessionStamp;
+  metadata.sessionSeq = seq;
+  // OPAQUE: joined with "." purely for legibility. The parts are themselves
+  // uuid-timestamp strings containing "-" (and could gain more), so this is
+  // NOT a parseable encoding — compare it and grep it, never split it apart.
+  // The components are alongside for anything that needs them structurally.
+  metadata.eventId = `${metadata.browserTag as string}.${sessionStamp}.${seq}`;
+
   if(verboseEvents) {
     metadata.ts = Date.now();
     metadata.human_ts = Date();
-    metadata.sessionIndex = eventIndex++;
-    metadata.sessionTag = sessionStamp;
-    metadata.browserTag = browserStamp();
   }
 }
 
@@ -237,6 +270,41 @@ export async function mergeMetadata (inputList: MetadataInput[]): Promise<Record
 
 export function delay (ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Persistent failure log (the localStorage leg of the failure heuristic:
+// console + localStorage + consumer surface; see README "Failure handling").
+//
+// Budget by calculation, not vibes: browsers guarantee ~5 MB per origin for
+// localStorage, and lo_event already stores the redux blob there. We cap the
+// failure log at a small, fixed slice and ring-buffer it (drop oldest lines),
+// so it can never grow toward the quota no matter how many failures occur.
+// 128 K chars ≈ 256 KB (UTF-16) ≈ ~5% of the guaranteed budget — hundreds of
+// entries, leaving the rest for the app and the blob.
+const FAILURE_LOG_KEY = 'lo_event_failures';
+const FAILURE_LOG_MAX_CHARS = 128 * 1024;
+
+/**
+ * Append a failure record to a bounded, ring-buffered localStorage log
+ * (NDJSON, newest last). Deliberately NOT wired to every debug.error — only
+ * call it for notable failures worth persisting, so the log can't grow
+ * exponentially. No-op (console remains the record) outside a browser or if
+ * storage is unavailable/full.
+ */
+export function recordFailure (entry: Record<string, unknown>): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const line = JSON.stringify({ ...entry, ts: new Date().toISOString() });
+    const prev = localStorage.getItem(FAILURE_LOG_KEY) || '';
+    let next = prev ? `${prev}\n${line}` : line;
+    // Ring-buffer: drop whole oldest lines until within budget.
+    while (next.length > FAILURE_LOG_MAX_CHARS && next.includes('\n')) {
+      next = next.slice(next.indexOf('\n') + 1);
+    }
+    localStorage.setItem(FAILURE_LOG_KEY, next);
+  } catch {
+    // Quota exceeded or storage blocked — console already has it; drop.
+  }
 }
 const MS = 1;
 const SECS = 1000 * MS;
