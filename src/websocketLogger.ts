@@ -108,11 +108,15 @@ export function websocketLogger (
   }: WebsocketLoggerOptions = {}
 ): Logger {
   let serverUrl = typeof server === 'string' ? server : wsHost(server);
+  // Storage identity must not depend on whether a mutable server override is
+  // read before or after the first enqueue. Explicit/app namespaces supersede
+  // this stable construction-time fallback.
+  const defaultQueueNamespace = serverUrl;
   let queueNamespace = namespace ?? null;
   let queue: Queue | null = null;
   const profile = autoack ? 'autoack' : 'durable';
   const outbox = (): Queue => {
-    const resolved = queueNamespace ?? serverUrl;
+    const resolved = queueNamespace ?? defaultQueueNamespace;
     return queue ??= new Queue(`lo-event:${encodeURIComponent(resolved)}:${profile}`, { queueType });
   };
 
@@ -124,7 +128,7 @@ export function websocketLogger (
   let socket: WebSocket | null = null;
   let socketAttempt = 0;
   let initialized = false;
-  let stopped = false;
+  let initialization: Promise<void> | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let waitingOnDisabler = false;
 
@@ -232,10 +236,9 @@ export function websocketLogger (
   }
 
   async function leaseLoop (): Promise<void> {
-    while (!stopped) {
+    while (true) {
       try {
         await gate.wait();
-        if (stopped) return;
         const leaseGeneration = engine.generation();
         const { seq, item } = await outbox().leaseNext();
         const frame = typeof item === 'string' ? item : JSON.stringify(item);
@@ -334,7 +337,7 @@ export function websocketLogger (
 
   async function connectionLoop (): Promise<void> {
     let failures = 0;
-    while (!stopped) {
+    while (true) {
       try {
         const opened = await runConnection();
         failures = opened ? 0 : failures + 1;
@@ -342,7 +345,7 @@ export function websocketLogger (
         failures++;
         debug.error('websocketLogger: connection loop failed', error);
       }
-      if (!stopped) await util.delay(backoffDelay(failures));
+      await util.delay(backoffDelay(failures));
     }
   }
 
@@ -433,7 +436,7 @@ export function websocketLogger (
     }
   };
 
-  logger.init = async () => {
+  logger.init = () => initialization ??= (async () => {
     initialized = true;
     try {
       const stored = await new Promise<Record<string, unknown>>(resolve => storage.get('lo_server', resolve));
@@ -456,7 +459,7 @@ export function websocketLogger (
     if (fetchState) await submit(() => engine.requestState(FETCH_BLOB_FRAME));
     void connectionLoop().catch(error => debug.error('websocketLogger: connection loop stopped', error));
     void leaseLoop().catch(error => debug.error('websocketLogger: lease loop stopped', error));
-  };
+  })();
 
   logger.setField = data => {
     if (!disabler.storeEvents()) return;

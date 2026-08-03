@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { websocketLogger } from '../src/websocketLogger.js';
 import { QueueType } from '../src/queue.js';
+import { storage } from '../src/browserStorage.js';
+import 'fake-indexeddb/auto';
 
 const NativeWebSocket = globalThis.WebSocket;
 
@@ -8,6 +10,7 @@ class FakeWebSocket {
   static instances = [];
   static acknowledge = false;
   static answerSnapshots = true;
+  static autoOpen = true;
 
   readyState = 0;
   onopen = null;
@@ -19,10 +22,12 @@ class FakeWebSocket {
 
   constructor () {
     FakeWebSocket.instances.push(this);
-    queueMicrotask(() => {
-      this.readyState = 1;
-      this.onopen?.();
-    });
+    if (FakeWebSocket.autoOpen) {
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.onopen?.();
+      });
+    }
   }
 
   send (data) {
@@ -57,6 +62,8 @@ afterAll(() => { globalThis.WebSocket = NativeWebSocket; });
 beforeEach(() => {
   FakeWebSocket.acknowledge = false;
   FakeWebSocket.answerSnapshots = true;
+  FakeWebSocket.autoOpen = true;
+  storage.set({ lo_server: undefined });
 });
 
 async function connectedLogger (options = {}) {
@@ -98,6 +105,38 @@ describe('WebSocket adapter', () => {
     expect(await logger.unackedCount()).toBe(0);
     logger.requestState();
     await vi.waitFor(() => expect(socket.sent.filter(frame => frame.event === 'fetch_blob')).toHaveLength(2));
+  });
+
+  it('initializes only once when init is called repeatedly', async () => {
+    const before = FakeWebSocket.instances.length;
+    const logger = websocketLogger('ws://test.invalid', {
+      namespace: crypto.randomUUID(),
+      queueType: QueueType.IN_MEMORY,
+      fetchState: false
+    });
+
+    await Promise.all([logger.init(), logger.init()]);
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBe(before + 1));
+  });
+
+  it('keeps a stable direct-use outbox namespace across a server override', async () => {
+    FakeWebSocket.autoOpen = false;
+    const originalServer = `ws://original-${crypto.randomUUID()}.invalid`;
+    storage.set({ lo_server: `ws://override-${crypto.randomUUID()}.invalid` });
+
+    const beforeInit = websocketLogger(originalServer, {
+      queueType: QueueType.PERSISTENT,
+      fetchState: false
+    });
+    beforeInit(JSON.stringify({ event: 'before-init' }));
+    await vi.waitFor(async () => expect(await beforeInit.unackedCount()).toBe(1));
+
+    const afterInit = websocketLogger(originalServer, {
+      queueType: QueueType.PERSISTENT,
+      fetchState: false
+    });
+    await afterInit.init();
+    expect(await afterInit.unackedCount()).toBe(1);
   });
 
   it('sends a recovered backlog before requesting its snapshot', async () => {
